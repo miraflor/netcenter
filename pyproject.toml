@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netcenter"
+version = "0.3.0"
+description = "Exact absolute 1-center and weighted 1-median tools for undirected road networks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["gis", "road-network", "facility-location", "1-center", "1-median"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+gis = [
+  "shapely>=2.0",
+  "geopandas>=0.14",
+  "pyproj>=3.4",
+]
+dev = [
+  "pytest>=7",
+  "ruff>=0.6",
+  "build>=1.2",
+  "shapely>=2.0",
+  "geopandas>=0.14",
+  "pyproj>=3.4",
+]
+
+[project.scripts]
+netcenter = "netcenter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["netcenter*"]
+
+[tool.ruff]
+line-length = 92
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
