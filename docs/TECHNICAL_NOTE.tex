@@ -1,3 +1,4 @@
+
 \documentclass[11pt]{article}
 
 \usepackage[margin=1in]{geometry}
@@ -15,6 +16,7 @@
 
 \definecolor{codegray}{gray}{0.96}
 \definecolor{darkgray}{gray}{0.25}
+
 \lstset{
   basicstyle=\ttfamily\small,
   backgroundcolor=\color{codegray},
@@ -30,7 +32,7 @@
 
 \pagestyle{fancy}
 \fancyhf{}
-\lhead{\texttt{netcenter} v0.3.0}
+\lhead{\texttt{netcenter} v0.1.0}
 \rhead{Algorithms and implementation}
 \cfoot{\thepage}
 \setlength{\headheight}{14pt}
@@ -44,686 +46,1746 @@
 \newcommand{\ecc}{\operatorname{ecc}}
 \newcommand{\clip}{\operatorname{clip}}
 
-\title{\textbf{Technical Discussion of \texttt{netcenter}}\\
-\large Network Construction, Shortest Paths, the 1-Median, and the Absolute 1-Center}
-\author{Technical note for \texttt{netcenter} v0.3.0}
-\date{15 August 2026}
+\title{
+\textbf{Technical Discussion of \texttt{netcenter}}\\
+\large Network Construction, Shortest Paths, the 1-Median, and the Absolute 1-Center
+}
+
+\author{Technical note for \texttt{netcenter} v0.1.0}
+\date{24 September 2026}
 
 \begin{document}
+
 \maketitle
 
 \begin{abstract}
-\texttt{netcenter} solves three closely related facility-location problems on an
-undirected road network: a weighted network 1-median restricted to vertices, a
-vertex-restricted minimax 1-center, and an absolute 1-center whose facility may
-lie anywhere along an edge.  The implementation combines GIS preprocessing,
-sparse shortest paths, and a vectorized exact edge sweep for the absolute
-center.  This note formalizes the mathematical model, explains how each source
-module implements the model, describes the computational optimizations, and
-audits the differences between the current v0.3.0 code and the initial
-prototype.
 
-The central conclusion is that \emph{the facility-location algorithms have not
-been replaced}.  The median still relies on Hakimi's vertex-optimality result,
-and the absolute center is still obtained by minimizing the upper envelope of
-edgewise distance functions.  Most changes since the prototype are validation,
-memory management, or exact-preserving reductions.  The important substantive
-deviations are instead in \emph{network construction}: the code no longer
-planarizes every geometric crossing by default, it recovers junctions from
-shared source vertices, it chooses the retained component by road length rather
-than node count, and it more strictly enforces metric coordinate systems.  These
-choices can change the graph, and therefore can change the numerical location,
-without changing the mathematical location problem being solved on that graph.
+\texttt{netcenter} is a Python package for solving classical facility-location
+problems on undirected spatial networks.
+
+Given a road or other line-based network and an optional set of demand
+locations, the package computes:
+
+\begin{enumerate}[leftmargin=1.5em]
+\item a weighted network 1-median;
+\item a vertex-restricted 1-center; and
+\item an exact absolute 1-center whose optimum may lie in the interior of a
+network edge.
+\end{enumerate}
+
+Distances are shortest-path distances on the constructed network rather than
+Euclidean distances in the plane. The facility-location mathematics is
+classical: the median and absolute-center formulation follows Hakimi, while the
+continuous center computation follows the edgewise structure developed in the
+network-location literature, particularly Kariv and Hakimi. The package does
+not claim a new location algorithm.
+
+The package-specific work lies primarily in geospatial network construction,
+topology safeguards, numerical handling, memory management, vectorized
+implementation, pruning, parallel execution, and regression testing. This
+document describes both the mathematics and the implementation provenance of
+the first public release, v0.1.0, including the main pre-release corrections and
+engineering decisions.
+
 \end{abstract}
 
-\tableofcontents
-\newpage
+\section{Scope and notation}
 
-\section{What the package solves}
+Let
 
-Let an undirected road network be a finite metric graph
 \[
-G=(V,E,\ell),
+G=(V,E)
 \]
-where $V=\{1,\dots,n\}$ is the vertex set, $E$ is the set of road segments,
-and every edge $e\in E$ has positive length $\ell_e$.  The geometric
-realization of the graph, including the interior of every edge, is denoted by
-$|G|$.  Shortest-path distance on this metric graph is $d_G(\cdot,\cdot)$.
 
-The package takes a finite set of demand locations
-\[
-Q=\{q_1,\dots,q_k\}\subseteq V
-\]
-after demand points have been snapped to network vertices.  Thus the facility
-may be continuous on the network for the absolute-center problem, but demand is
-\emph{discrete vertex demand}.  This distinction is essential: the package does
-not solve the variant in which every point of every road is itself a demand
-point.
+be a connected undirected network with non-negative edge lengths.
 
-For the selected demand vertices, define the demand-by-node distance matrix
+Let
+
 \[
-D_{iv}=d_G(q_i,v), \qquad D\in\R^{k\times n}.
+Q=\{q_1,\ldots,q_k\}\subseteq V
 \]
-The code in \texttt{distances.py} constructs this matrix; the optimization
-routines in \texttt{center.py} then work almost entirely with $D$ and the edge
-list.
+
+be the unique demand vertices after external observations have been mapped to
+the network and duplicate locations have been coalesced.
+
+Let
+
+\[
+d_G(x,y)
+\]
+
+denote shortest-path distance in the network.
+
+Write
+
+\begin{itemize}[leftmargin=1.5em]
+\item \(n=|V|\) for the number of network vertices;
+\item \(m=|E|\) for the number of network edges;
+\item \(k=|Q|\) for the number of unique demand vertices;
+\item \(L\) for the length of a particular edge.
+\end{itemize}
+
+The package currently solves three related location problems.
 
 \subsection{Weighted 1-median}
 
-Given nonnegative demand weights $w_i$, the weighted 1-median is
-\[
- x_M \in \argmin_{x\in |G|}
- \sum_{i=1}^{k} w_i d_G(q_i,x).
-\]
-For vertex demand on a network, Hakimi's vertex-optimality theorem implies that
-an optimum can be chosen at a vertex \cite{Hakimi1964}.  Consequently
-\texttt{weighted\_median()} evaluates
-\[
- F(v)=\sum_{i=1}^{k} w_iD_{iv}
-\]
-for every $v\in V$ and returns a minimizing vertex.  In matrix notation the
-weighted calculation is simply
-\[
- (F(1),\dots,F(n))=w^\top D.
-\]
-If no weights are supplied, all $w_i=1$.
+Given non-negative demand weights \(w_i\),
 
-\subsection{Vertex-restricted minimax center}
+\[
+x^*
+=
+\argmin_{x\in V}
+\sum_{i=1}^{k}
+w_i d_G(x,q_i).
+\]
 
-The second objective restricts the facility to $V$ and minimizes the largest
-distance to the selected demand set:
+This is the network minisum objective.
+
+For vertex demand, Hakimi's vertex-optimality result implies that an optimal
+median may be chosen at a network vertex \cite{Hakimi1964}. The implementation
+therefore evaluates network vertices rather than searching edge interiors.
+
+\subsection{Vertex 1-center}
+
+The vertex 1-center solves
+
 \[
- x_V\in\argmin_{v\in V}\max_{1\le i\le k}D_{iv}.
+x^*
+=
+\argmin_{x\in V}
+\max_i d_G(x,q_i).
 \]
-The quantity
-\[
- \ecc_Q(v)=\max_i D_{iv}
-\]
-is the eccentricity of $v$ relative to the chosen demand set.  When $Q=V$ this
-is the classical graph-center or Jordan-center problem.  When $Q\subsetneq V$,
-``Jordan center'' is convenient shorthand in the code, but the precise object
-is a \emph{demand-restricted vertex 1-center}.
+
+This is a node-restricted minimax objective.
 
 \subsection{Absolute 1-center}
 
-The absolute 1-center removes the vertex restriction on the facility:
+The absolute 1-center allows the candidate location to lie anywhere on the
+network:
+
 \[
- x_A\in\argmin_{x\in |G|}\max_{1\le i\le k}d_G(q_i,x).
+x^*
+=
+\argmin_{x\in G}
+\max_i d_G(x,q_i).
 \]
-Hakimi showed that, unlike the median, an absolute center need not be a graph
-vertex \cite{Hakimi1964}.  The optimum may occur strictly inside a road segment.
-The main algorithmic work of \texttt{netcenter} is therefore an exact search of
-edge interiors after the shortest-path matrix is known.
 
-\section{End-to-end computational pipeline}
+Unlike the median, an optimal absolute center need not occur at a vertex and may
+lie strictly inside an edge \cite{Hakimi1964}. This edge-interior case is the
+principal mathematical reason for the package.
 
-The repository deliberately separates GIS semantics from mathematical
-optimization.  The major modules have the following roles.
+\section{Algorithmic lineage}
 
-\begin{center}
-\begin{tabular}{p{0.22\linewidth}p{0.70\linewidth}}
-\toprule
-\textbf{Module} & \textbf{Responsibility}\\
-\midrule
-\texttt{graph.py} & Reads linework, chooses a metre-based CRS, establishes
-junction topology, creates graph vertices and road segments, retains a connected
-component, and snaps external demand points to network nodes.\\
-\texttt{topology.py} & Converts endpoint arrays into a symmetric sparse
-adjacency matrix while preserving shortest parallel-edge cost.\\
-\texttt{distances.py} & Computes shortest-path distances from demand nodes using
-SciPy's Dijkstra implementation, in bounded source chunks.\\
-\texttt{center.py} & Implements the weighted 1-median, demand-restricted vertex
-1-center, lower-bound pruning, and the continuous edge sweep for the absolute
-1-center.\\
-\texttt{solve.py} & Coalesces repeated snapped demands, orchestrates the distance
-and optimization stages, and converts abstract results back to map coordinates.\\
-\texttt{cli.py} & Exposes the pipeline to files and command-line options.\\
-\bottomrule
-\end{tabular}
-\end{center}
+Every major mathematical component of \texttt{netcenter} is classical.
 
-Conceptually, the computation is
-\[
-\text{linework}
-\longrightarrow G
-\longrightarrow Q
-\longrightarrow D
-\longrightarrow
-\{x_M,x_V,x_A\}.
-\]
-A wrong answer may therefore arise either because the optimization is wrong or
-because the constructed graph is not the road network the analyst intended.
-In applied GIS work, the second risk is often the larger one.
+The principal references are:
 
-\section{Constructing the road graph}
+\begin{itemize}[leftmargin=1.5em]
 
-\subsection{Metric coordinate system}
+\item Hakimi \cite{Hakimi1964}, who formulated the absolute center and median
+of a graph and established the key vertex-optimality result used by the median
+solver;
 
-All edge lengths, snap-grid spacing, demand snap distances, and reported offsets
-are interpreted as metres.  The builder therefore requires a projected,
-metre-based working CRS.  Geographic input is reprojected to an inferred local
-UTM CRS unless the caller supplies an explicit target CRS.  Already projected
-metre-based data are preserved rather than being reprojected unnecessarily.
-Projected data in other linear units are converted to a metre-based CRS when
-possible.
+\item Hakimi \cite{Hakimi1965}, who extended the network-location framework to
+multiple facilities;
 
-This is not part of the classical facility-location algorithm; it is a
-measurement precondition.  Dijkstra and the location objectives are only as
-meaningful as the edge weights supplied to them.
+\item Kariv and Hakimi \cite{KarivHakimi1979a}, who developed algorithmic
+methods for network \(p\)-center problems, including the continuous
+absolute-center case;
 
-\subsection{Three topology modes}
+\item Kariv and Hakimi \cite{KarivHakimi1979b}, for the corresponding
+\(p\)-median literature;
 
-A central design question is whether two lines that cross in the plane are
-actually connected in the road network.
+\item Handler and Mirchandani \cite{HandlerMirchandani1979}, for a systematic
+treatment of location on networks and the classical edgewise center
+formulation;
 
-\paragraph{Default: shared-source-vertex noding.}
-The current default does \emph{not} create a junction at every geometric
-crossing.  Instead, a coordinate location already used by at least two distinct
-input LineStrings is treated as source evidence of a junction.  If that shared
-coordinate occurs in the interior of either line, the line is split there.
-This recovers common OSM-style T- and X-junctions while leaving an ordinary
-bridge/underpass crossing disconnected when the two ways share no source
-vertex.
+\item Daskin \cite{Daskin2013}, for a modern treatment of network and discrete
+facility-location models.
 
-Coordinate identity is determined on an integer quantization grid.  For grid
-spacing $s>0$, a coordinate $p=(x,y)$ is mapped to
-\[
- q_s(p)=\left(\operatorname{round}(x/s),
-              \operatorname{round}(y/s)\right)\in\mathbb{Z}^2.
-\]
-Locations with the same integer pair are treated as identical for node identity.
-This is deliberately described as a \emph{grid spacing}, not as a Euclidean
-``within $s$ metres'' tolerance: two very close points can fall on opposite grid
-boundaries, while two points in one grid cell can differ along both axes.
+\end{itemize}
 
-\paragraph{Strict endpoint-only mode.}
-If shared-vertex splitting is disabled, topology is inherited only from line
-endpoints.  This is appropriate when the source has already been normalized so
-that every true junction is an endpoint of each incident segment.
+Additional algorithms used as supporting infrastructure are also classical:
 
-\paragraph{Optional full planar noding.}
-With \texttt{node=True}, the linework is unioned/noded so that geometric
-crossings become graph junctions.  GEOS/Shapely provides the geometric
-operation.  This mode is correct for a truly planar network, but it can invent
-false turns between grade-separated roads.  Shapely explicitly describes full
-noding as adding all segment intersections to linework \cite{ShapelyNode}.
+\begin{itemize}[leftmargin=1.5em]
 
-\subsection{Closed rings, slivers, and node compaction}
+\item Dijkstra's shortest-path algorithm \cite{Dijkstra1959};
 
-A closed road ring has coincident endpoints.  If such a geometry were converted
-directly into an endpoint graph, it could become a self-loop and then disappear
-when self-loops are discarded.  The builder therefore cuts closed and
-nearly-closed rings into ordinary segments before endpoint indexing.
+\item k-d trees for nearest-neighbor lookup, due to Bentley
+\cite{Bentley1975};
 
-After endpoint identities are assigned, zero-length/self-loop artifacts and
-segments below \texttt{min\_length} are removed.  Because this filtering can
-leave node identifiers no surviving edge uses, v0.3.0 compacts node IDs before
-the sparse graph is created.  This prevents an unused row/column from appearing
-as an isolated connected component.
+\item connected-component analysis using standard graph traversal, with the
+classical algorithmic lineage represented by Hopcroft and Tarjan
+\cite{HopcroftTarjan1973};
+
+\item sweep-line segment-intersection algorithms such as Bentley--Ottmann
+\cite{BentleyOttmann1979}, relevant to planar noding;
+
+\item finite-precision geometric techniques including Greene and Yao
+\cite{GreeneYao1986} and Hobby \cite{Hobby1999}, relevant to robust geometric
+intersection and snap rounding.
+
+\end{itemize}
+
+The package does not reimplement all of these algorithms. Several are delegated
+to SciPy, Shapely, GEOS, and related numerical/geospatial libraries.
+
+\section{From spatial linework to a graph}
+
+A GIS line layer records geometry, not necessarily routing topology.
+
+Two line geometries may cross in the plane without permitting movement between
+them. Conversely, a genuine junction may occur at a coordinate appearing in
+the interior of one or more LineStrings.
+
+Accordingly, graph construction is part of the model, not merely a
+file-conversion step.
+
+\subsection{Default topology rule: shared-source-vertex noding}
+
+The default behavior is \emph{shared-source-vertex noding}.
+
+If a snapped coordinate already appears as a source vertex in at least two
+distinct input LineStrings, the location is treated as a junction and the
+participating lines are split there.
+
+This recovers common T-junctions and shared interior-interior junctions already
+encoded in source linework.
+
+It does not create a new junction merely because two segments cross
+geometrically in two dimensions.
+
+This distinction reduces the risk of false turns at:
+
+\begin{itemize}[leftmargin=1.5em]
+\item bridges;
+\item flyovers;
+\item tunnels;
+\item grade-separated intersections.
+\end{itemize}
+
+The shared-source-vertex rule is straightforward topology recovery rather than
+a new graph algorithm.
+
+\subsection{Endpoint-only mode}
+
+If the source is already segmented at every true junction, the caller may
+disable shared-vertex splitting.
+
+In this mode, connectivity is inferred strictly from line endpoints.
+
+\subsection{Explicit planar noding}
+
+The caller may explicitly request full planar noding.
+
+In that mode, geometric crossings are converted into junctions.
+
+This is appropriate only when every two-dimensional crossing genuinely
+represents connectivity.
+
+The sweep-line method for reporting all intersections among a set of segments
+is due to Bentley and Ottmann \cite{BentleyOttmann1979}. Practical finite
+precision intersection handling and snap rounding have their own computational
+geometry literature, including Greene and Yao \cite{GreeneYao1986} and Hobby
+\cite{Hobby1999}.
+
+\texttt{netcenter} does not implement those algorithms directly. Planar noding
+is delegated to Shapely/GEOS \cite{ShapelyNode}. GEOS itself descends from the
+JTS Topology Suite.
+
+\subsection{Shape vertices and topology vertices}
+
+Road geometries often contain many intermediate coordinates whose purpose is
+only to describe curvature.
+
+Those coordinates are geometrically useful but need not all survive as graph
+vertices.
+
+Reducing unnecessary shape vertices matters because the shortest-path matrix
+scales with the number of graph nodes.
+
+Line merging is delegated to Shapely/GEOS.
+
+\subsection{Matching near-identical coordinates}
+
+Endpoints intended to coincide may differ at very small floating-point scales.
+
+The graph builder quantizes coordinates to a configurable grid before assigning
+node identity. This is an engineering convention rather than a named algorithm.
 
 \subsection{Parallel edges}
 
-The geometric edge list may contain more than one road segment joining the same
-pair of graph vertices.  The sparse adjacency used for shortest paths must then
-store the \emph{shortest} direct connection,
+Real road data may contain multiple segments joining the same pair of graph
+vertices.
+
+For shortest-path purposes, the sparse adjacency stores the minimum direct edge
+length between a node pair.
+
+This is important because converting a sparse coordinate matrix to CSR can sum
+duplicate entries if not handled carefully. Summing parallel road lengths would
+be wrong and can violate the metric assumptions used by the center sweep.
+
+\subsection{Closed and nearly closed rings}
+
+A closed LineString has coincident start and end coordinates.
+
+If treated naively, it can become a self-loop and disappear during graph
+cleaning.
+
+The graph builder detects closed and nearly closed rings and splits them before
+graph construction so that the physical network remains represented.
+
+\subsection{Filtered slivers and orphan nodes}
+
+Small slivers or snapped self-loops may be removed after preliminary node IDs
+have been assigned.
+
+The current implementation compacts node IDs after edge filtering so removed
+edges do not leave isolated matrix rows or columns that later produce spurious
+infinite distances.
+
+\subsection{Connected components}
+
+Real line datasets often contain isolated fragments.
+
+Identifying connected components is standard graph traversal; the classical
+algorithmic lineage includes Hopcroft and Tarjan \cite{HopcroftTarjan1973}.
+The package uses SciPy's sparse graph routines rather than implementing a
+component algorithm directly.
+
+When component filtering is enabled, the retained component is selected by
+total road length rather than merely node count.
+
+\section{Coordinate systems and metric units}
+
+The mathematical optimization assumes meaningful edge lengths.
+
+The package therefore operates in a projected coordinate reference system whose
+units are metres.
+
+The policy is:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item projected metre-based input is preserved;
+
+\item geographic input is transformed to an inferred local UTM CRS unless an
+explicit target CRS is supplied;
+
+\item projected input using non-metre units is transformed;
+
+\item an explicitly supplied target CRS must be projected and metre-based.
+
+\end{itemize}
+
+For geographically large study regions, the analyst should supply a projection
+appropriate to the full study area rather than rely automatically on a single
+UTM zone.
+
+\section{Demand representation}
+
+External demand observations need not coincide exactly with graph vertices.
+
+The current package maps each demand observation to the nearest network node.
+
+For a point observation \(p_i\),
+
 \[
- c_{uw}=\min_{e:\,e=(u,w)}\ell_e,
+q_i
+=
+\argmin_{v\in V}
+\|p_i-v\|_2.
 \]
-rather than the sum of duplicate sparse entries.  The full geometric edge list
-is still retained for the absolute-center sweep, so a longer parallel road can
-remain a possible facility location even though endpoint-to-endpoint shortest
-paths use the shorter parallel connection.
 
-\subsection{Connected component policy}
+The nearest-node lookup is performed with a k-d tree, using SciPy's
+\texttt{cKDTree}; the k-d tree was introduced by Bentley
+\cite{Bentley1975}.
 
-The default build retains one connected component so that all selected demands
-can reach all retained vertices.  v0.3.0 chooses the component with the greatest
-total retained road length,
+A maximum snapping distance may be imposed.
+
+This is an explicit modeling assumption: demand is represented at vertices, not
+continuously along edges.
+
+\subsection{Non-point geometries}
+
+If a demand layer contains polygons or other non-point geometries, each usable
+geometry is converted to a representative point before snapping.
+
+\subsection{Repeated snapped demand}
+
+Several observations may snap to the same network node.
+
+For the minimax objectives, multiplicity has no effect:
+
 \[
- C^*=\argmax_C\sum_{e\in E(C)}\ell_e,
+\max\{d(x,v),d(x,v)\}
+=
+d(x,v).
 \]
-rather than the component with the greatest number of vertices.  This is a
-modeling/preprocessing policy, not a facility-location theorem.  Analysts for
-whom islands or disconnected service territories are substantively important
-should solve those components separately.
 
-\section{Demand snapping and exact coalescing}
+Duplicate center demands can therefore be removed exactly.
 
-External demand points are attached to their nearest \emph{network node} using
-a k-d tree, an application of the multidimensional binary-search-tree idea of
-Bentley \cite{Bentley1975}.  If $z_i\in\R^2$ is an external point and $p_v$ is a
-network-node coordinate, the snapped node is
+For the median, multiplicity matters. Their weights are summed:
+
 \[
- q_i=\argmin_{v\in V}\|z_i-p_v\|_2.
+w_v
+=
+\sum_{i:q_i=v} w_i.
 \]
-A maximum allowed snapping distance can be imposed so that highly simplified
-roads do not silently move demand by an implausible amount.
 
-Repeated demand observations can snap to the same vertex.  Before Dijkstra,
-\texttt{solve.py} coalesces those duplicates.  This is mathematically exact.
-For the center objective,
+Thus duplicate-demand coalescing reduces shortest-path work without changing
+either optimization problem.
+
+\section{Shortest-path matrix}
+
+After demand coalescing, the package computes a shortest-path matrix
+
 \[
- \max\{d(q,x),d(q,x),\ldots\}=d(q,x),
+D\in\R^{k\times n},
 \]
-so multiplicity is irrelevant.  For the median, all weights assigned to the
-same snapped vertex are summed:
+
+where
+
 \[
- \widetilde w_q=\sum_{i:q_i=q} w_i.
+D_{iv}
+=
+d_G(q_i,v).
 \]
-Therefore the total weighted-distance objective is unchanged.  This reduction
-can substantially decrease the number of Dijkstra source rows without changing
-any objective value.
 
-\section{Shortest-path distance matrix}
+Shortest paths are computed using Dijkstra's algorithm
+\cite{Dijkstra1959} through SciPy's sparse graph implementation
+\cite{SciPyDijkstra}.
 
-\texttt{distances.py} computes
-\[
-D_{iv}=d_G(q_i,v)
-\]
-with Dijkstra's shortest-path algorithm \cite{Dijkstra1959}.  The graph is
-required to be square, nonnegative, finite on stored edges, and symmetric.  The
-symmetry check matters because the package calls SciPy in undirected mode and
-does not model one-way roads or asymmetric travel costs.  SciPy exposes
-Dijkstra for both directed and undirected sparse graphs \cite{SciPyDijkstra}.
+The graph is required to be square, non-negative, and symmetric because the
+package currently models undirected networks.
 
-For $k$ source demands, $n$ vertices, and $m$ sparse edges, a conventional
+\subsection{Computational cost}
+
+For \(k\) demand sources, \(n\) nodes, and \(m\) edges, a conventional
 binary-heap complexity statement is approximately
+
 \[
- O\!\left(k(m+n\log n)\right),
+O\!\left(k(m+n\log n)\right),
 \]
+
 although actual SciPy performance depends on implementation details and graph
-structure.  The returned matrix itself requires
+structure.
+
+The matrix itself requires
+
 \[
- O(kn)
+O(kn)
 \]
-storage, which is often the practical memory bottleneck.
 
-\subsection{Chunking and parallel assembly}
+storage.
 
-SciPy's Dijkstra output is produced in bounded groups of source vertices.  If a
-chunk contains $r$ sources, its temporary result has roughly $rn$ floating-point
-cells.  The code chooses $r$ from \texttt{max\_temp\_mb} so that one float64
-Dijkstra block remains within a target memory budget.
+In many practical instances, memory usage of \(D\) is a more important limit
+than the arithmetic required by the location objective.
 
-If the requested final dtype is float32, each completed block is cast before it
-is written into the final preallocated matrix.  Parallel blocks are consumed as
-an ordered generator rather than accumulated and then concatenated.  These are
-memory-management choices only: they do not change which shortest paths
-Dijkstra computes.
+\subsection{Chunking}
 
-\section{The absolute-center edge sweep}
+Dijkstra calculations are performed in bounded groups of source nodes.
 
-\subsection{Distance to demand from an interior edge point}
+If a block contains \(r\) demand sources, its temporary output contains
+approximately \(rn\) floating-point values.
 
-Consider an edge $e=(u,w)$ of length $L$.  Parameterize a point $x(t)$ on the
-edge by its distance $t\in[0,L]$ from $u$.  For demand $q_i$, let
+The \texttt{max\_temp\_mb} parameter controls the target size of one temporary
+float64 block per worker.
+
+\subsection{Streaming parallel assembly}
+
+When several Dijkstra blocks are computed in parallel, completed blocks are
+written directly into a preallocated final matrix.
+
+This avoids retaining every completed block and then constructing another full
+matrix by concatenation.
+
+\subsection{Reduced precision}
+
+The final shortest-path matrix may optionally be stored in float32.
+
+Approximate storage requirements are:
+
 \[
- a_i=d_G(q_i,u)=D_{iu},\qquad
- b_i=d_G(q_i,w)=D_{iw}.
+8kn \text{ bytes}
 \]
-Any route from the interior point to the rest of the graph must first reach one
-of the endpoints, so
+
+for float64 and
+
+\[
+4kn \text{ bytes}
+\]
+
+for float32.
+
+Float32 is a memory--precision trade-off. The optimization remains internally
+consistent with the stored matrix, but the stored metric is itself rounded
+relative to float64 output.
+
+\section{Weighted 1-median}
+
+For every candidate node \(v\), define
+
+\[
+M(v)
+=
+\sum_{i=1}^{k}
+w_iD_{iv}.
+\]
+
+The weighted network median is
+
+\[
+v^*
+=
+\argmin_{v\in V}M(v).
+\]
+
+Hakimi's vertex-optimality result reduces the continuous network median problem
+to this finite evaluation for vertex demand \cite{Hakimi1964}.
+
+In matrix notation, if
+
+\[
+w=
+\begin{bmatrix}
+w_1 & \cdots & w_k
+\end{bmatrix},
+\]
+
+then
+
+\[
+M=wD.
+\]
+
+The implementation is therefore a weighted reduction over the shortest-path
+matrix followed by an \texttt{argmin}.
+
+If no explicit weights are supplied, unit weights are used.
+
+With unit weights, minimizing the total distance is closely related to
+maximizing closeness centrality, whose classical lineage includes Bavelas
+\cite{Bavelas1950} and Freeman \cite{Freeman1978}.
+
+On trees, related median and center problems admit simpler algorithms; Goldman
+\cite{Goldman1971} is a classical reference.
+
+\section{Vertex 1-center}
+
+For each candidate vertex \(v\), define eccentricity relative to the selected
+demand set:
+
+\[
+E(v)
+=
+\max_iD_{iv}.
+\]
+
+The vertex center is
+
+\[
+v^*
+=
+\argmin_{v\in V}E(v).
+\]
+
+Computationally, this is a columnwise maximum over \(D\), followed by an
+\texttt{argmin}.
+
+The resulting radius
+
+\[
+R_V
+=
+\min_{v\in V}\max_iD_{iv}
+\]
+
+also provides a valid incumbent for the continuous absolute-center search.
+
+On trees, the classical graph center goes back to Jordan
+\cite{Jordan1869}.
+
+\section{Absolute 1-center}
+
+The absolute-center problem requires searching edge interiors.
+
+Consider edge
+
+\[
+e=(u,w)
+\]
+
+with length \(L\).
+
+Parameterize a point \(x(t)\) on the edge by distance
+
+\[
+t\in[0,L]
+\]
+
+from endpoint \(u\).
+
+For demand \(q_i\), define
+
+\[
+a_i=d_G(q_i,u),
+\qquad
+b_i=d_G(q_i,w).
+\]
+
+Any route from the interior point to the remainder of the graph must leave the
+edge through one of its endpoints.
+
+Therefore
+
 \begin{equation}
- d_G(q_i,x(t))
- =\min\{a_i+t,\;b_i+L-t\}.
- \label{eq:tent}
+d_G(q_i,x(t))
+=
+\min\{a_i+t,\;b_i+L-t\}.
+\label{eq:tent}
 \end{equation}
-This is a tent-shaped piecewise-linear function: the route through $u$ rises
-with slope $+1$, while the route through $w$ falls with slope $-1$.
 
-The two alternatives are equal at
+This is a tent-shaped piecewise-linear function.
+
+\subsection{Switch point}
+
+The two endpoint routes are equal when
+
+\[
+a_i+t
+=
+b_i+L-t.
+\]
+
+Thus the switch point is
+
 \begin{equation}
- t_i^*=\frac{b_i-a_i+L}{2}.
- \label{eq:breakpoint}
+t_i^*
+=
+\frac{b_i-a_i+L}{2}.
+\label{eq:switch}
 \end{equation}
-Because the edge itself is a path of length $L$ between $u$ and $w$, shortest
-paths obey
-\[
- |a_i-b_i|\le L,
-\]
-which implies $t_i^*\in[0,L]$ in exact arithmetic.
 
-\subsection{Upper envelope on one edge}
+Because \(u\) and \(w\) are connected by an edge of length \(L\),
 
-The edge eccentricity is
 \[
- E_e(t)=\max_i d_G(q_i,x(t)).
+|a_i-b_i|\le L
 \]
-Sort the breakpoints so that
-\[
- t_{(1)}^*\le t_{(2)}^*\le\cdots\le t_{(k)}^*.
-\]
-Between any two consecutive breakpoints, the set of demands using the falling
-branch and the set using the rising branch are fixed.  On interval $I_j$, define
-\[
- A_j=\max_{i:\,t_i^*\ge I_j} a_i,
- \qquad
- B_j=\max_{i:\,t_i^*\le I_j} b_i,
-\]
-with the obvious empty-set treatment at the two outer intervals.  The upper
-envelope on that interval reduces to
-\begin{equation}
- E_e(t)=\max\{A_j+t,\;B_j+L-t\}.
- \label{eq:vshape}
-\end{equation}
-The first term is increasing and the second decreasing, so their maximum is a
-V-shaped convex function on the interval.  The unconstrained crossing is
-\[
- \widehat t_j=\frac{B_j+L-A_j}{2}.
-\]
-The interval minimizer is therefore
-\begin{equation}
- t_j=\clip(\widehat t_j;\,\underline t_j,\overline t_j),
-\end{equation}
-where clipping moves an out-of-interval crossing to the nearest endpoint.
-Evaluating \eqref{eq:vshape} at all $k+1$ intervals and taking the best gives the
-exact edge minimum in exact arithmetic.
 
-The implementation computes $A_j$ with suffix running maxima and $B_j$ with
-prefix running maxima.  Thus, after sorting the $k$ breakpoints, the remaining
-work is linear in $k$.  The cost per swept edge is
+by the triangle inequality, hence
+
 \[
- O(k\log k).
+t_i^*\in[0,L]
 \]
+
+in exact arithmetic.
+
+\subsection{Upper envelope}
+
+The eccentricity of \(x(t)\) is
+
+\[
+E_e(t)
+=
+\max_i d_G(q_i,x(t)).
+\]
+
+Sort the switch points:
+
+\[
+t_{(1)}^*
+\le
+t_{(2)}^*
+\le
+\cdots
+\le
+t_{(k)}^*.
+\]
+
+Between consecutive switch points, the sets of demands using the two endpoint
+branches remain fixed.
+
+On one such interval,
+
+\[
+E_e(t)
+=
+\max\{A+t,\;B+L-t\},
+\]
+
+where \(A\) is the largest \(a_i\) among demands still using the \(u\)-side
+branch, and \(B\) is the largest \(b_i\) among demands using the \(w\)-side
+branch.
+
+The first term rises with slope \(+1\) and the second falls with slope \(-1\).
+
+Their unconstrained intersection occurs at
+
+\[
+\widehat t
+=
+\frac{B+L-A}{2}.
+\]
+
+For interval
+
+\[
+[\underline t,\overline t],
+\]
+
+the interval minimizer is
+
+\[
+t^*
+=
+\clip(
+\widehat t;
+\underline t,
+\overline t
+).
+\]
+
+Evaluating all breakpoint intervals yields the exact minimum on the edge,
+modulo floating-point precision.
+
+\subsection{Prefix and suffix maxima}
+
+After sorting the switch points, the implementation computes:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item suffix maxima of the \(a_i\);
+
+\item prefix maxima of the \(b_i\).
+
+\end{itemize}
+
+This gives all values of \(A\) and \(B\) in linear work after sorting.
+
+The resulting per-edge complexity is
+
+\[
+O(k\log k),
+\]
+
+dominated by sorting.
+
 This is a direct computational realization of the classical absolute-center
-structure initiated by Hakimi and developed algorithmically in subsequent
-network-location work, including Kariv and Hakimi \cite{Hakimi1964,KarivHakimi1979}.
-The package does not implement later linear-time/parametric-search refinements.
+edge structure associated with Hakimi and Kariv--Hakimi
+\cite{Hakimi1964,KarivHakimi1979a}, with textbook treatment in Handler and
+Mirchandani \cite{HandlerMirchandani1979} and Daskin
+\cite{Daskin2013}.
 
-\subsection{Safe lower-bound pruning}
+The particular NumPy prefix/suffix organization is an implementation choice,
+not a separate location algorithm.
 
-Sweeping every edge would have worst-case cost $O(mk\log k)$.  Before sorting,
-\texttt{absolute\_center()} obtains a valid incumbent radius from the best
-vertex,
+\subsection{Related literature not implemented}
+
+Minieka \cite{Minieka1970} studied the related \(m\)-center problem and
+continuous-network variants.
+
+Megiddo \cite{Megiddo1983} later developed parametric-search techniques that
+remove logarithmic factors in related network-center computations. Those
+refinements are not implemented here.
+
+\section{Safe edge pruning}
+
+Sweeping every edge is often unnecessary.
+
+The vertex-center radius
+
 \[
- R_V=\min_{v\in V}\max_iD_{iv}.
+R_V
+=
+\min_{v\in V}\max_iD_{iv}
 \]
-For any point $x(t)$ on edge $(u,w)$ and any demand $i$,
+
+is already a feasible absolute-center solution.
+
+For any point \(x(t)\) on edge \((u,w)\),
+
 \[
- d_G(q_i,x(t))
- =\min\{a_i+t,b_i+L-t\}
- \ge \min\{a_i,b_i\}.
+d_G(q_i,x(t))
+=
+\min\{D_{iu}+t,\;D_{iw}+L-t\}.
 \]
+
+Because \(t\ge0\) and \(L-t\ge0\),
+
+\[
+d_G(q_i,x(t))
+\ge
+\min\{D_{iu},D_{iw}\}.
+\]
+
 Therefore every point on the edge satisfies
+
 \begin{equation}
- E_e(t)\ge
- LB_e:=\max_i\min\{D_{iu},D_{iw}\}.
- \label{eq:lowerbound}
+E_e(t)
+\ge
+LB_e
+:=
+\max_i\min\{D_{iu},D_{iw}\}.
+\label{eq:lowerbound}
 \end{equation}
-If $LB_e$ is already no better than the incumbent (allowing a conservative
-floating-point margin), the edge cannot materially improve the current answer
-and need not be sorted.  This is exact branch-and-bound logic in real
-arithmetic.  It is an implementation acceleration, not a different center
+
+If \(LB_e\) cannot improve the incumbent radius, the edge need not be swept.
+
+This is exact branch-and-bound logic in real arithmetic.
+
+It is an implementation acceleration rather than a different facility-location
 objective.
 
-\subsection{Numerical exactness}
+\section{Numerical safeguards}
 
-The mathematical sweep is exact for a supplied shortest-path metric.  The
-software necessarily adds floating-point policy:
+The mathematical algorithms operate over exact real-valued network distances,
+while the implementation uses floating-point arithmetic.
+
+Several safeguards are therefore applied.
+
+\subsection{Breakpoint clipping}
+
+The triangle inequality should place every switch point in \([0,L]\).
+
+Tiny numerical violations are defensively clipped:
+
+\[
+t_i^*
+\leftarrow
+\clip(t_i^*;0,L).
+\]
+
+\subsection{Pruning tolerance}
+
+When the distance matrix uses reduced precision, a lower bound may differ
+slightly from its exact value.
+
+A dtype- and scale-aware margin is included when comparing lower bounds with the
+incumbent radius so a candidate edge is not discarded solely because of
+floating-point rounding.
+
+\subsection{Meaning of exactness}
+
+The absolute-center sweep is algorithmically exact for the supplied
+shortest-path matrix.
+
+Thus, ``exact'' means:
+
+\begin{quote}
+exact for the stored network metric, modulo explicit floating-point tolerance.
+\end{quote}
+
+A float32 run is therefore exact with respect to the float32 distance matrix,
+but that matrix is itself a reduced-precision approximation to the
+corresponding float64 metric.
+
+\section{Parallel execution and memory management}
+
+The package separates mathematical computation from execution strategy.
+
+Parallelism does not change the mathematical objective or intended result.
+
+\subsection{Shortest-path blocks}
+
+Demand sources are divided into bounded blocks.
+
+Each block is passed to SciPy's Dijkstra routine.
+
+Results are written directly into a preallocated final matrix.
+
+\subsection{Absolute-center blocks}
+
+The edge sweep operates on bounded groups of segment--demand cells.
+
+The \texttt{max\_cells} parameter controls peak temporary storage.
+
+\subsection{Worker policy}
+
+One worker is the conservative default.
+
+Additional workers may be requested explicitly.
+
+The package exposes process- and thread-based backends because their
+performance and memory trade-offs depend on:
+
 \begin{itemize}[leftmargin=1.5em]
-\item breakpoints are defensively clipped to $[0,L]$ against tiny numerical
-violations of the triangle inequality;
-\item a scale-aware pruning margin prevents float32 rounding from discarding a
-borderline candidate edge;
-\item improvements smaller than the configured numerical tolerance can be
-reported as tied with the incumbent vertex.
+\item graph size;
+\item demand count;
+\item operating system;
+\item SciPy build;
+\item available RAM;
+\item memory bandwidth.
 \end{itemize}
-Accordingly, ``exact'' should be read as \emph{algorithmically exact modulo the
-explicit floating-point tolerance and the precision of the stored distance
-matrix}.  With the default float64 matrix and the default tolerance, this
-numerical qualification is normally negligible.  A float32 run is an optional
-memory-saving approximation to the original float64 metric, even though the
-search is internally consistent with the rounded matrix.
 
-\section{Pseudocode for the complete solution}
+No backend is assumed to be universally superior.
 
-The following pseudocode mirrors the current architecture without Python-specific
-details.
+\section{Complete computational pipeline}
+
+The first public release can be summarized as follows.
 
 \begin{lstlisting}
-BUILD-NETWORK(linework, grid s, topology_mode):
-    transform linework to a projected metre-based CRS
-    remove empty/non-line geometries
+BUILD-NETWORK(linework, topology options):
 
-    if topology_mode == PLANAR:
-        split at every geometric crossing
-    else if topology_mode == SHARED_VERTEX:
-        split at interior coordinates shared by distinct source lines
+    project linework to a metre-based CRS
+    remove unusable geometries
 
-    split closed or nearly closed rings
-    quantize segment endpoints on grid s and assign node IDs
-    remove self-loops and slivers
+    if planar noding requested:
+        split at geometric crossings
+
+    else if shared-vertex noding enabled:
+        split where source vertices are shared
+        by distinct input lines
+
+    preserve closed rings
+    identify network nodes
+    remove slivers and self-loops
     compact unused node IDs
 
-    create sparse undirected adjacency:
-        for parallel node pairs, retain minimum length for shortest paths
+    create undirected sparse adjacency
+    retain minimum direct weight for parallel node pairs
 
-    optionally retain the connected component with greatest road length
-    return Network(nodes, geometric_edges, sparse_adjacency)
+    optionally restrict to a connected component
 
-SOLVE(Network G, snapped demands Q, weights w):
-    coalesce repeated demand nodes
-        - duplicates vanish for minimax objectives
-        - duplicate median weights are summed
+    return network
 
-    D <- multi-source Dijkstra distances from Q to all graph nodes
 
-    median <- argmin_v sum_i w_i D[i,v]
-    vertex_center <- argmin_v max_i D[i,v]
+PREPARE-DEMAND(demand):
+
+    convert non-point geometries to representative points
+    transform to network CRS
+    snap each observation to nearest network node
+    enforce optional maximum snap distance
+    coalesce duplicate snapped nodes
+
+    return unique demand nodes and median weights
+
+
+SOLVE(network, demand):
+
+    D <- shortest-path distances from demand nodes
+         to all network vertices using Dijkstra
+
+    median <-
+        argmin_v sum_i w_i D[i,v]
+
+    vertex_center <-
+        argmin_v max_i D[i,v]
 
     incumbent <- vertex_center
-    for each geometric edge e=(u,w,L):
-        LB[e] <- max_i min(D[i,u], D[i,w])
-    candidates <- edges whose LB can improve incumbent
 
-    for each candidate edge e:
+    for each edge e=(u,w,L):
+
+        LB[e] <-
+            max_i min(D[i,u], D[i,w])
+
+    discard edges that cannot improve incumbent
+
+    for each surviving edge:
+
         a_i <- D[i,u]
         b_i <- D[i,w]
-        t_i* <- (b_i - a_i + L)/2
-        sort demands by t_i*
-        build suffix maxima of a_i and prefix maxima of b_i
-        analytically minimize the V-envelope on each breakpoint interval
-        keep the best point on e
 
-    absolute_center <- better of incumbent and all candidate-edge minima
-    return median, vertex_center, absolute_center
+        switch_i <-
+            (b_i - a_i + L) / 2
+
+        sort demands by switch_i
+
+        compute suffix maxima of a_i
+        compute prefix maxima of b_i
+
+        analytically minimize
+            max(A + t, B + L - t)
+        on every breakpoint interval
+
+    absolute_center <-
+        best of vertex incumbent
+        and surviving edge-interior candidates
+
+    return median,
+           vertex_center,
+           absolute_center
 \end{lstlisting}
 
-\section{Complexity and practical bottlenecks}
+\section{Complexity}
 
-Let $n=|V|$, $m=|E|$, and let $k$ denote the number of \emph{unique snapped}
-demand nodes after coalescing.
+A useful high-level complexity summary is:
 
 \begin{center}
-\begin{tabular}{p{0.30\linewidth}p{0.25\linewidth}p{0.36\linewidth}}
+\begin{tabular}{p{0.30\linewidth}p{0.26\linewidth}p{0.35\linewidth}}
 \toprule
-\textbf{Stage} & \textbf{Indicative cost} & \textbf{Practical note}\\
+\textbf{Stage} & \textbf{Indicative cost} & \textbf{Source / comment} \\
 \midrule
-Demand nearest-node lookup & about $O(k\log n)$ per query set & k-d-tree behavior depends on dimension/data distribution.\\
-Dijkstra distance matrix & $O(k(m+n\log n))$ conventional bound & Usually the dominant computation; matrix storage is $O(kn)$.\\
-Weighted 1-median & $O(kn)$ & One weighted column reduction.\\
-Vertex 1-center & $O(kn)$ & One columnwise maximum plus minimum.\\
-Edge lower bounds & $O(km)$ worst case & Vectorized and blocked.\\
-Absolute-center sweep & $O(mk\log k)$ worst case & In practice only unpruned edges are sorted.\\
+
+Planar intersection reporting
+&
+\(O((s+i)\log s)\)
+&
+Bentley--Ottmann for \(s\) segments and \(i\) intersections.
+\\
+
+Nearest-node demand mapping
+&
+approximately \(O(k\log n)\)
+&
+k-d tree; behavior depends on data distribution.
+\\
+
+Shortest-path matrix
+&
+approximately \(O(k(m+n\log n))\)
+&
+Dijkstra; often the dominant stage.
+\\
+
+Weighted 1-median
+&
+\(O(kn)\)
+&
+Hakimi vertex reduction followed by weighted column sum.
+\\
+
+Vertex 1-center
+&
+\(O(kn)\)
+&
+Columnwise maximum followed by minimum.
+\\
+
+Edge lower bounds
+&
+\(O(km)\)
+&
+Blocked and vectorized.
+\\
+
+Absolute-center sweep
+&
+\(O(mk\log k)\) worst case
+&
+Only unpruned edges are swept in practice.
+\\
+
 \bottomrule
 \end{tabular}
 \end{center}
 
-The package is therefore not primarily CPU-bound by the final edge sweep on
-many realistic instances.  The $k\times n$ shortest-path matrix is often the
-larger computational and memory constraint.  This is why duplicate-demand
-coalescing, chunking, and careful dtype selection matter.
+The shortest-path matrix requires \(O(kn)\) memory and is frequently the
+practical bottleneck.
 
-\section{Did v0.3.0 deviate from the original algorithms?}
+\section{Implementation work beyond the published algorithms}
 
-\subsection{Short answer}
+The mathematical objectives and their classical structure are not novel.
 
-\fbox{\begin{minipage}{0.94\linewidth}
-\textbf{No, not in the core facility-location mathematics.}  The current code
-still solves the same weighted 1-median, demand-restricted vertex 1-center, and
-absolute 1-center with vertex demand.  The absolute-center implementation still
-uses the same edgewise breakpoint/upper-envelope sweep as the initial prototype.
+The following implementation choices were developed during pre-release work,
+including AI-assisted development sessions. They should be understood as
+engineering on top of the published algorithms rather than as new facility
+location methods.
 
-\medskip
-\textbf{Yes, in the end-to-end graph-construction behavior.}  Several deliberate
-changes alter how GIS linework becomes the graph on which those unchanged
-algorithms operate.  Those changes can legitimately move the final centers
-because they change $G$, not because they change the optimization objective.
-\end{minipage}}
+\subsection{Optimizations}
 
-\subsection{Detailed audit}
+\begin{enumerate}[leftmargin=1.5em]
+
+\item \textbf{Segment pruning by a lower bound.}
+
+The bound
+
+\[
+LB_e
+=
+\max_i \min\{D_{iu},D_{iw}\}
+\]
+
+is used to eliminate edges that cannot improve the best known vertex radius.
+
+\item \textbf{Batched vectorization of the sweep.}
+
+Many candidate edges are solved simultaneously using NumPy arrays. Prefix and
+suffix running maxima replace repeated interval-by-interval loops.
+
+\item \textbf{Memory-budgeted sweep blocking.}
+
+The absolute-center sweep processes bounded groups of segment--demand cells so
+temporary memory does not scale directly with the entire edge set.
+
+\item \textbf{Contiguous sort inputs.}
+
+Endpoint-distance arrays are copied into row-contiguous blocks before
+per-edge sorting to simplify and accelerate vectorized operations.
+
+\item \textbf{Conservative parallelism.}
+
+Worker count is treated as a maximum, not a promise. Small workloads remain
+serial when worker startup would dominate useful work.
+
+\item \textbf{Bounded shortest-path chunks.}
+
+Dijkstra source nodes are processed in bounded row groups and cast promptly to
+the requested storage dtype.
+
+\item \textbf{Streaming parallel assembly.}
+
+Parallel Dijkstra results are consumed in order and written directly into the
+final matrix rather than accumulated and stacked afterward.
+
+\item \textbf{Exact demand coalescing.}
+
+Repeated observations snapped to the same node are solved once. Counts or
+weights are preserved exactly for the median, while duplicates vanish from the
+minimax objective.
+
+\item \textbf{Scale-aware pruning tolerance.}
+
+The pruning margin widens according to the stored floating-point dtype so a
+borderline edge is not removed merely because of rounding.
+
+\end{enumerate}
+
+\subsection{An optimization tried and rejected}
+
+A best-first bound-tightening strategy was explored during pre-release
+development.
+
+The idea was to sweep the most promising edges first, update the incumbent
+radius, and then repeat pruning with the tighter bound.
+
+This is standard branch-and-bound practice.
+
+It was removed because measurements showed that the first lower-bound pass
+already reduced the candidate edge set sufficiently that the second pruning
+stage did not justify the added complexity.
+
+This history is retained to prevent future optimization work from repeating the
+same experiment without measurement.
+
+\section{Correctness bugs found and fixed during pre-release development}
+
+Several important failures were identified before the first public release.
+These are worth documenting because they could produce plausible wrong answers
+rather than obvious crashes.
+
+\subsection{Parallel edges silently summed}
+
+Sparse COO-to-CSR conversion can add duplicate entries.
+
+If two roads join the same pair of graph nodes and their lengths are summed,
+the resulting direct edge weight may become larger than a valid alternative
+path.
+
+This can violate the metric structure expected by the absolute-center sweep.
+
+The current implementation collapses parallel edges using the minimum direct
+length.
+
+\subsection{Closed loops deleted}
+
+A closed road may merge into a LineString whose endpoints coincide.
+
+If the result is then interpreted as a self-loop and removed, the entire ring
+disappears from the graph.
+
+The current graph builder splits such rings before self-loop filtering.
+
+\subsection{Empty geometries corrupting endpoint lookup}
+
+Empty geometries can produce invalid coordinate runs and incorrect endpoint
+association if not removed before indexing.
+
+The graph builder filters unusable geometries before endpoint extraction.
+
+\subsection{Needless reprojection}
+
+Automatically reprojecting all input to a locally inferred UTM zone is
+appropriate for geographic coordinates but can be wrong for input already
+projected in valid metre units.
+
+The current implementation preserves projected metre-based input and only
+reprojects when necessary.
+
+\subsection{Nearly closed rings deleted}
+
+A ring can be visually closed while its first and last coordinates differ by
+floating-point noise.
+
+Exact closure tests may miss this case.
+
+The graph builder uses the same snapping tolerance used for node identity when
+detecting nearly closed rings.
+
+\subsection{False junctions at grade-separated crossings}
+
+Treating every two-dimensional line crossing as connected can create impossible
+turns between bridges, flyovers, tunnels, and roads below them.
+
+Full planar noding is therefore explicit rather than the default.
+
+\subsection{Shared-vertex noding initially too narrow}
+
+An earlier pre-release rule handled T-junctions where one line ended on the
+interior of another but still missed cases where two lines both continued
+through a shared source vertex.
+
+The current rule defines a junction by participation of at least two distinct
+input LineStrings at the snapped source coordinate.
+
+\subsection{Filtered slivers leaving orphan graph nodes}
+
+Assigning node IDs before removing slivers and snapped self-loops can leave
+unused rows and columns in the sparse graph.
+
+The current implementation compacts node IDs after edge filtering.
+
+\section{Validation strategy}
+
+Validation separates facility-location mathematics from GIS graph-construction
+correctness as much as possible.
+
+\subsection{Hand-computable cases}
+
+Small networks with known answers test:
+
+\begin{itemize}[leftmargin=1.5em]
+\item weighted median locations;
+\item vertex centers;
+\item edge-interior absolute centers.
+\end{itemize}
+
+\subsection{Independent edge sampling}
+
+The continuous absolute-center solution is compared with independent brute-force
+sampling along network edges on randomly generated test networks.
+
+The sampled solution is approximate, but it shares no breakpoint logic with the
+exact sweep.
+
+It therefore provides an independent check of the sweep implementation.
+
+\subsection{What brute force does not validate}
+
+Brute-force edge sampling validates the optimizer conditional on the supplied
+graph and shortest-path matrix.
+
+It does not validate whether the graph correctly represents the intended road
+system.
+
+For example, no numerical test can determine from geometry alone whether a
+bridge should connect to a road below it.
+
+That remains a topology and data-semantics question.
+
+\subsection{Regression coverage}
+
+Regression tests cover failures including:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item parallel edges being combined incorrectly;
+
+\item closed rings disappearing as self-loops;
+
+\item nearly closed rings being lost because of floating-point differences;
+
+\item empty geometries corrupting node assignment;
+
+\item false connections at geometric bridge crossings;
+
+\item missed T-junctions;
+
+\item missed shared interior-interior junctions;
+
+\item filtered edges leaving isolated graph nodes;
+
+\item invalid projected units;
+
+\item disconnected demand/network combinations;
+
+\item worker-count and block-size invariance;
+
+\item float32 pruning behavior;
+
+\item package-version and CLI consistency.
+
+\end{itemize}
+
+\section{Pre-release development history}
+
+Before v0.1.0, the codebase underwent several internal development and review
+iterations.
+
+Those intermediate states were not intended to define a public semantic-version
+sequence and are therefore described here simply as \emph{pre-release
+development history}.
+
+The important distinction is between:
+
+\begin{enumerate}[leftmargin=1.5em]
+
+\item changes to the mathematical facility-location problem; and
+
+\item changes to the graph, numerical representation, and implementation on
+which that problem is solved.
+
+\end{enumerate}
+
+The core optimization problems remained the same throughout pre-release
+development:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item weighted vertex 1-median;
+
+\item vertex-restricted minimax center;
+
+\item continuous absolute 1-center.
+
+\end{itemize}
+
+Most substantive pre-release changes instead concerned:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item safer road-network topology;
+
+\item correct treatment of parallel edges;
+
+\item preservation of rings;
+
+\item coordinate-system handling;
+
+\item duplicate-demand reduction;
+
+\item bounded-memory shortest paths;
+
+\item numerical validation;
+
+\item parallel execution;
+
+\item regression coverage.
+
+\end{itemize}
+
+These changes can alter a numerical answer when they alter the graph \(G\) being
+represented, but they do not define a different median or center objective.
+
+\section{Audit: same mathematics versus changed preprocessing}
+
+The table below summarizes the distinction.
 
 \small
-\begin{longtable}{p{0.20\linewidth}p{0.25\linewidth}p{0.29\linewidth}p{0.18\linewidth}}
+
+\begin{longtable}{p{0.21\linewidth}p{0.29\linewidth}p{0.29\linewidth}p{0.15\linewidth}}
 \toprule
-\textbf{Aspect} & \textbf{Initial prototype} & \textbf{v0.3.0} & \textbf{Algorithmic deviation?}\\
+\textbf{Aspect}
+&
+\textbf{Early prototype}
+&
+\textbf{v0.1.0}
+&
+\textbf{Changed mathematics?}
+\\
 \midrule
 \endfirsthead
+
 \toprule
-\textbf{Aspect} & \textbf{Initial prototype} & \textbf{v0.3.0} & \textbf{Algorithmic deviation?}\\
+\textbf{Aspect}
+&
+\textbf{Early prototype}
+&
+\textbf{v0.1.0}
+&
+\textbf{Changed mathematics?}
+\\
 \midrule
 \endhead
 
-Weighted 1-median & Minimize weighted total shortest-path distance at vertices. & Same objective and same vertex evaluation. & \textbf{No.}\\
+Weighted 1-median
+&
+Weighted total shortest-path distance over vertices.
+&
+Same objective and vertex reduction.
+&
+No.
+\\
 \addlinespace
-Vertex minimax center & Minimize maximum demand distance over vertices. & Same objective and reduction. & \textbf{No.}\\
+
+Vertex 1-center
+&
+Maximum demand distance minimized over vertices.
+&
+Same objective and computation.
+&
+No.
+\\
 \addlinespace
-Absolute 1-center & Edge-interior facility location using sorted tent breakpoints and prefix/suffix maxima. & Same breakpoint/envelope sweep. & \textbf{No.}\\
+
+Absolute 1-center
+&
+Continuous edge-interior minimax problem using breakpoint structure.
+&
+Same mathematical problem and same edgewise envelope structure.
+&
+No.
+\\
 \addlinespace
-Shortest paths & Dijkstra on a sparse undirected graph. & Same Dijkstra stage, now validated, chunked, and stream-assembled. & \textbf{No.}\\
+
+Shortest paths
+&
+Dijkstra on an undirected sparse graph.
+&
+Same shortest-path metric, with stronger validation and bounded-memory execution.
+&
+No.
+\\
 \addlinespace
-Lower-bound pruning & $\max_i\min(D_{iu},D_{iw})$ used to avoid hopeless edges. & Same mathematical bound with a more conservative numerical margin. & \textbf{No}; safer implementation.\\
+
+Edge pruning
+&
+Lower bound based on endpoint distances.
+&
+Same bound with more conservative floating-point handling.
+&
+No.
+\\
 \addlinespace
-Vectorization / blocking & Batched NumPy sweep with a memory cell budget. & Retained, with stricter parameter validation. & \textbf{No.}\\
+
+Demand duplicates
+&
+Could produce repeated shortest-path rows.
+&
+Coalesced exactly before shortest-path computation.
+&
+No.
+\\
 \addlinespace
-Demand duplicates & Repeated snapped demand could lead to repeated Dijkstra source rows. & Unique snapped nodes are solved once; median weights/counts are aggregated. & \textbf{No}; exact reduction.\\
+
+Crossing treatment
+&
+Earlier prototype could planarize all crossings.
+&
+Shared-source-vertex noding is default; full planar noding is explicit.
+&
+Preprocessing changed.
+\\
 \addlinespace
-Default crossing treatment & Original prototype defaulted to full planar noding (every 2-D crossing treated as connected). & Default avoids invented crossings and instead splits at vertices shared by distinct source lines; full planar noding is opt-in. & \textbf{Yes, preprocessing/model semantics.}\\
+
+Shared interior junctions
+&
+Not fully recovered in the earliest rule.
+&
+Recovered when distinct source LineStrings share a snapped source vertex.
+&
+Preprocessing changed.
+\\
 \addlinespace
-Shared-vertex junctions & Not a distinct topology mode in the earliest prototype. & Recovers T- and X-junctions from source vertices without connecting mere bridge crossings. & \textbf{Yes, graph construction.}\\
+
+Connected component choice
+&
+Could depend on node count.
+&
+Uses total road length.
+&
+Preprocessing changed.
+\\
 \addlinespace
-Connected component choice & Largest component by node count. & Component with greatest total road length. & \textbf{Yes, preprocessing policy.}\\
+
+CRS handling
+&
+Weaker assumptions about projected units.
+&
+Metre-based projected CRS required or constructed explicitly.
+&
+Measurement policy changed.
+\\
 \addlinespace
-CRS handling & Earlier versions could make weaker assumptions about projected units. & Explicitly requires/constructs a metre-based projected CRS and preserves valid metric projected input. & \textbf{Yes, measurement policy}; objective unchanged.\\
+
+Parallel-edge handling
+&
+Duplicate sparse entries could sum.
+&
+Minimum direct edge length retained.
+&
+Bug fix.
+\\
 \addlinespace
-Parallel-edge CSR construction & Early sparse conversion could sum duplicate entries. & Minimum direct edge length is stored for each node pair. & \textbf{Bug fix}, restoring intended shortest-path graph.\\
+
+Closed rings
+&
+Could disappear as self-loops.
+&
+Preserved by splitting before graph construction.
+&
+Bug fix.
+\\
 \addlinespace
-Closed rings & Could be lost as self-loops in early construction. & Rings are split before endpoint graph creation. & \textbf{Bug fix}, restoring intended geometry.\\
+
+Unused node IDs
+&
+Could survive edge filtering.
+&
+Compacted after filtering.
+&
+Bug fix.
+\\
 \addlinespace
-Unused node IDs & Filtering could leave orphan CSR rows/columns. & Nodes are compacted after filtering. & \textbf{Bug fix}.\\
-\addlinespace
-Numerical precision & Primarily float64-oriented. & float64 remains available/default in the Python API; float32 storage is optional with conservative pruning tolerance. & \textbf{Optional numerical approximation} only when lower precision is chosen.\\
-\addlinespace
-Parallel defaults & More aggressive worker defaults in early code. & One worker is the conservative default; process/thread backends are explicit choices. & \textbf{No}; scheduling only.\\
+
+Precision
+&
+Primarily float64-oriented.
+&
+float32 storage optional with safe pruning tolerance.
+&
+Optional numerical approximation only.
+\\
+
 \bottomrule
 \end{longtable}
+
 \normalsize
 
-\subsection{The most important distinction}
-
-There are two different senses of ``same algorithm'':
-
-\begin{enumerate}[leftmargin=1.5em]
-\item \textbf{Same optimization problem and mathematical method.}  In this
-sense v0.3.0 is highly faithful to the original.  The objective functions,
-shortest-path metric, and edge sweep are unchanged in substance.
-
-\item \textbf{Same end-to-end mapping from a GIS file to coordinates.}  In this
-sense v0.3.0 is deliberately \emph{not} identical.  A bridge crossing, a shared
-OSM vertex, a disconnected fragment, a non-metre CRS, or a filtered sliver may
-produce a different graph than in the earliest version.  A mathematically
-identical center algorithm applied to a different graph can of course return a
-different center.
-\end{enumerate}
-
-This distinction is desirable.  The purpose of the revisions was not to invent
-a new facility-location algorithm, but to ensure that the classical algorithm
-is applied to a graph that more faithfully encodes the analyst's intended road
-network.
+The most important point is that the location objective and the classical
+absolute-center method remained stable. The pre-release changes mostly improved
+the graph to which those algorithms are applied.
 
 \section{Scope and limitations}
 
-The current implementation is deliberately narrower than the full network
-location literature.
+The first public release deliberately addresses a restricted class of
+network-location problems.
+
+\subsection{Undirected networks}
+
+The graph is undirected.
+
+The package does not currently model:
 
 \begin{itemize}[leftmargin=1.5em]
-\item \textbf{Undirected network only.}  One-way roads, turn restrictions, and
-asymmetric time costs require a directed-state representation and a different
-interior-edge treatment.
-
-\item \textbf{Unweighted minimax center.}  Demand weights affect the median but
-not the center.  A weighted minimax objective changes the slopes of the edgewise
-functions and cannot simply reuse the present suffix/prefix structure unchanged.
-
-\item \textbf{Vertex demand.}  The facility may lie inside an edge, but the
-demand set is finite and snapped to vertices.  This is not the all-points
-continuous-network center.
-
-\item \textbf{One facility.}  The package solves $p=1$.  General $p$-center and
-$p$-median problems have substantially different computational difficulty;
-Kariv and Hakimi's 1979 papers are foundational for that broader setting
-\cite{KarivHakimi1979}.
-
-\item \textbf{Node snapping rather than edge projection.}  External demand is
-assigned to the nearest node.  On heavily simplified road data this can be a
-strong modeling assumption, which is why snap distances should be inspected and
-bounded.
-
-\item \textbf{Geometry does not encode all traffic rules.}  Shared source
-vertices are treated as evidence of connectivity, but the builder does not
-interpret OSM-style bridge, tunnel, layer, one-way, or turn-restriction tags.
+\item one-way streets;
+\item asymmetric travel costs;
+\item turn restrictions;
+\item time-dependent routing.
 \end{itemize}
 
-\section{Verification strategy}
+These require a different state representation and, in particular, a
+reconsideration of continuous edge-interior treatment.
 
-The test suite separates mathematical correctness from GIS correctness as much
-as possible.  The continuous edge sweep is checked against independently
-sampled brute-force searches on synthetic networks; hand-computable cases test
-median and center objectives; regression tests cover parallel edges, rings,
-shared-vertex T- and X-junctions, grade-separated non-junctions, disconnected
-components, invalid indices, asymmetric CSR input, and chunked shortest paths.
+\subsection{Vertex demand}
 
-Brute-force comparison is especially useful because it does not share the
-breakpoint logic of the sweep.  Nevertheless, it validates the optimizer only
-\emph{conditional on the supplied graph and distance matrix}.  No numerical
-test can determine whether a bridge in the source data was meant to connect to
-the road below.  Network semantics remain an input-data responsibility.
+External demand is snapped to graph vertices.
+
+Demand is not currently represented continuously along edge interiors.
+
+\subsection{Unweighted minimax objective}
+
+Weights affect the 1-median but not the center.
+
+The current center objective is
+
+\[
+\min_x\max_i d_G(x,q_i),
+\]
+
+not a weighted minimax variant.
+
+A weighted minimax objective changes the edgewise functions and cannot simply
+reuse the current prefix/suffix structure unchanged.
+
+\subsection{One facility}
+
+The package solves the \(p=1\) case.
+
+General \(p\)-center and \(p\)-median problems are substantially more difficult
+and belong to a broader optimization literature
+\cite{KarivHakimi1979a,KarivHakimi1979b}.
+
+\subsection{Static edge costs}
+
+Edge costs represent a fixed metric.
+
+Congestion, traffic variation, schedules, stochastic travel time, and other
+dynamic costs are outside the present scope.
+
+\subsection{Topology semantics}
+
+Geometry alone cannot fully determine real transportation connectivity.
+
+The graph builder does not automatically infer every bridge, tunnel, layer,
+access, one-way, or turn-restriction semantic from external road-database
+attributes.
+
+The analyst remains responsible for ensuring that the input network represents
+the intended movement system.
+
+\section{Network median versus geographic centroid}
+
+The network median should not be confused with a Euclidean centroid.
+
+For Euclidean coordinates \(x_i\), a weighted arithmetic centroid is
+
+\[
+\bar{x}
+=
+\frac{\sum_i w_i x_i}
+{\sum_i w_i}.
+\]
+
+Equivalently, it minimizes a squared Euclidean-distance objective.
+
+The network median instead minimizes
+
+\[
+\sum_i w_i d_G(x,q_i).
+\]
+
+It is therefore more naturally interpreted as a \emph{minisum accessibility
+center} than as a literal coordinate centroid.
+
+A closer network analogue of a Euclidean squared-distance centroid would be a
+Fr\'echet mean or network barycenter:
+
+\[
+x^*
+=
+\argmin_{x\in G}
+\sum_i w_i d_G(x,q_i)^2.
+\]
+
+That problem is not implemented in v0.1.0.
+
+\section{Implementation versus mathematical contribution}
+
+It is important to distinguish published facility-location mathematics from the
+package implementation.
+
+The following are classical:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item the network median objective;
+
+\item the absolute-center objective;
+
+\item vertex optimality of the network median for vertex demand;
+
+\item edge-interior absolute centers;
+
+\item shortest-path distance as the network metric;
+
+\item the breakpoint structure of the continuous center problem.
+
+\end{itemize}
+
+The following are implementation and engineering choices in \texttt{netcenter}:
+
+\begin{itemize}[leftmargin=1.5em]
+
+\item GIS linework preprocessing;
+
+\item shared-source-vertex topology recovery;
+
+\item defensive handling of rings, slivers, and parallel edges;
+
+\item demand coalescing;
+
+\item NumPy vectorization;
+
+\item prefix/suffix envelope evaluation;
+
+\item lower-bound pruning;
+
+\item blocked shortest-path computation;
+
+\item streaming parallel assembly;
+
+\item reduced-precision storage support;
+
+\item numerical tolerance policy;
+
+\item regression-test coverage.
+
+\end{itemize}
+
+No novelty claim is made for the underlying network-location algorithms.
 
 \section{Conclusion}
 
-\texttt{netcenter} is best understood as a classical network-location solver
-surrounded by unusually explicit GIS and numerical safeguards.  The mathematical
-core is compact:
+\texttt{netcenter} v0.1.0 is best understood as a practical geospatial
+implementation of classical network-location theory.
+
+Its mathematical core is compact:
 
 \begin{enumerate}[leftmargin=1.5em]
-\item build the shortest-path metric from selected demand vertices;
-\item evaluate the weighted 1-median and the vertex minimax center directly from
-$D$;
-\item use the vertex center as an incumbent;
-\item discard edges that cannot beat it using \eqref{eq:lowerbound};
-\item on each remaining edge, sort the route-switch breakpoints and minimize the
-piecewise V-shaped upper envelope exactly, modulo floating-point tolerance.
+
+\item construct a metric graph from linework;
+
+\item map demand to network vertices;
+
+\item compute shortest-path distances;
+
+\item solve the weighted 1-median directly over vertices;
+
+\item solve the vertex minimax center directly over vertices;
+
+\item use that center as an incumbent;
+
+\item prune edges whose lower bounds cannot improve the incumbent;
+
+\item solve the remaining edge-interior minimax problems analytically through
+breakpoint sorting and upper-envelope minimization.
+
 \end{enumerate}
 
-Relative to the initial prototype, v0.3.0 does \emph{not} constitute a new
-absolute-center algorithm.  Its principal advances are engineering and model
-fidelity: safer topology, more defensible metric units, exact duplicate-demand
-reduction, bounded-memory shortest paths, stricter validation, and regression
-coverage of graph-construction failures.  The only changes likely to move a
-result materially are precisely those that change the graph being represented
-or deliberately reduce numerical precision.
+The principal difficulty in practical use is not defining the objective but
+ensuring that the graph faithfully represents the intended transportation
+network.
+
+Accordingly, much of the package's engineering is devoted to topology,
+coordinate systems, memory safety, numerical safeguards, provenance, and
+validation rather than to modifying the classical facility-location
+mathematics.
 
 \begin{thebibliography}{99}
+
+\bibitem{Bavelas1950}
+A. Bavelas.
+\newblock Communication patterns in task-oriented groups.
+\newblock \emph{Journal of the Acoustical Society of America},
+22(6):725--730, 1950.
 
 \bibitem{Bentley1975}
 J. L. Bentley.
 \newblock Multidimensional binary search trees used for associative searching.
 \newblock \emph{Communications of the ACM}, 18(9):509--517, 1975.
 
+\bibitem{BentleyOttmann1979}
+J. L. Bentley and T. A. Ottmann.
+\newblock Algorithms for reporting and counting geometric intersections.
+\newblock \emph{IEEE Transactions on Computers}, C-28(9):643--647, 1979.
+
+\bibitem{Daskin2013}
+M. S. Daskin.
+\newblock \emph{Network and Discrete Location: Models, Algorithms, and Applications}.
+\newblock 2nd edition, Wiley, 2013.
+\newblock doi:10.1002/9781118537015.
+
 \bibitem{Dijkstra1959}
 E. W. Dijkstra.
 \newblock A note on two problems in connexion with graphs.
 \newblock \emph{Numerische Mathematik}, 1:269--271, 1959.
+
+\bibitem{Freeman1978}
+L. C. Freeman.
+\newblock Centrality in social networks: conceptual clarification.
+\newblock \emph{Social Networks}, 1(3):215--239, 1978.
+
+\bibitem{Goldman1971}
+A. J. Goldman.
+\newblock Optimal center location in simple networks.
+\newblock \emph{Transportation Science}, 5(2):212--221, 1971.
+
+\bibitem{GreeneYao1986}
+D. H. Greene and F. F. Yao.
+\newblock Finite-resolution computational geometry.
+\newblock In \emph{27th Annual Symposium on Foundations of Computer Science},
+pages 143--152, 1986.
 
 \bibitem{Hakimi1964}
 S. L. Hakimi.
@@ -732,22 +1794,75 @@ medians of a graph.
 \newblock \emph{Operations Research}, 12(3):450--459, 1964.
 \newblock doi:10.1287/opre.12.3.450.
 
-\bibitem{KarivHakimi1979}
+\bibitem{Hakimi1965}
+S. L. Hakimi.
+\newblock Optimum distribution of switching centers in a communication network
+and some related graph theoretic problems.
+\newblock \emph{Operations Research}, 13(3):462--475, 1965.
+\newblock doi:10.1287/opre.13.3.462.
+
+\bibitem{HandlerMirchandani1979}
+G. Y. Handler and P. B. Mirchandani.
+\newblock \emph{Location on Networks: Theory and Algorithms}.
+\newblock MIT Press, Cambridge, Massachusetts, 1979.
+
+\bibitem{Hobby1999}
+J. D. Hobby.
+\newblock Practical segment intersection with finite precision output.
+\newblock \emph{Computational Geometry}, 13(4):199--214, 1999.
+
+\bibitem{HopcroftTarjan1973}
+J. Hopcroft and R. Tarjan.
+\newblock Algorithm 447: efficient algorithms for graph manipulation.
+\newblock \emph{Communications of the ACM}, 16(6):372--378, 1973.
+
+\bibitem{Jordan1869}
+C. Jordan.
+\newblock Sur les assemblages de lignes.
+\newblock \emph{Journal f\"ur die reine und angewandte Mathematik},
+70:185--190, 1869.
+
+\bibitem{KarivHakimi1979a}
 O. Kariv and S. L. Hakimi.
-\newblock An algorithmic approach to network location problems. I: The
-$p$-centers.
-\newblock \emph{SIAM Journal on Applied Mathematics}, 37(3):513--538, 1979.
+\newblock An algorithmic approach to network location problems.
+I: The \(p\)-centers.
+\newblock \emph{SIAM Journal on Applied Mathematics},
+37(3):513--538, 1979.
 \newblock doi:10.1137/0137040.
+
+\bibitem{KarivHakimi1979b}
+O. Kariv and S. L. Hakimi.
+\newblock An algorithmic approach to network location problems.
+II: The \(p\)-medians.
+\newblock \emph{SIAM Journal on Applied Mathematics},
+37(3):539--560, 1979.
+\newblock doi:10.1137/0137041.
+
+\bibitem{Megiddo1983}
+N. Megiddo.
+\newblock Applying parallel computation algorithms in the design of serial
+algorithms.
+\newblock \emph{Journal of the ACM}, 30(4):852--865, 1983.
+
+\bibitem{Minieka1970}
+E. Minieka.
+\newblock The \(m\)-center problem.
+\newblock \emph{SIAM Review}, 12(1):138--139, 1970.
+
+\bibitem{MirchandaniFrancis1990}
+P. B. Mirchandani and R. L. Francis, editors.
+\newblock \emph{Discrete Location Theory}.
+\newblock Wiley, 1990.
 
 \bibitem{SciPyDijkstra}
 SciPy developers.
 \newblock \texttt{scipy.sparse.csgraph.dijkstra} documentation.
-\newblock \url{https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.dijkstra.html}, accessed 15 August 2026.
+\newblock \url{https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csgraph.dijkstra.html}.
 
 \bibitem{ShapelyNode}
 Shapely developers.
-\newblock \texttt{shapely.node} documentation, Shapely 2.1.2.
-\newblock \url{https://shapely.readthedocs.io/en/2.1.2/reference/shapely.node.html}, accessed 15 August 2026.
+\newblock \texttt{shapely.node} documentation.
+\newblock \url{https://shapely.readthedocs.io/en/stable/reference/shapely.node.html}.
 
 \end{thebibliography}
 

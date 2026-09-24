@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netcenter"
-version = "0.3.0"
+version = "0.1.0"
 description = "Exact absolute 1-center and weighted 1-median tools for undirected road networks"
 readme = "README.md"
 requires-python = ">=3.10"
