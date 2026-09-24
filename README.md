@@ -1,52 +1,592 @@
 # netcenter
 
-**Exact 1-centre and weighted 1-median locations on an undirected road network.**
+**Exact 1-median and 1-center location on undirected spatial networks.**
 
-`netcenter` answers three related facility-location questions:
+`netcenter` is a Python package and command-line tool for solving classical **network location problems** on road and other line-based transport networks.
 
-| Result | Objective | Candidate locations |
+Given a network and an optional set of demand locations, it computes:
+
+| Result | Objective | Candidate location |
 |---|---|---|
-| weighted 1-median | minimise total weighted road distance | network nodes |
-| vertex centre | minimise worst road distance | network nodes |
-| absolute 1-centre | minimise worst road distance | **any point on the network** |
+| **Weighted 1-median** | Minimize total weighted shortest-path distance | Network nodes |
+| **Vertex 1-center** | Minimize maximum shortest-path distance | Network nodes |
+| **Absolute 1-center** | Minimize maximum shortest-path distance | Anywhere on the network |
 
-The last case is the distinctive one. The optimum can lie in the interior of a
-road segment, so checking junctions alone can return the wrong minimax location.
+Unlike an ordinary geographic centroid, `netcenter` measures distance **through the network**. Barriers, bridges, ferry links, circuitous roads, and network topology therefore affect the solution.
 
-## Why v0.3.0
+The package is domain-neutral: demand locations can represent people, establishments, customers, facilities, settlements, observations, or any other points for which network distance matters.
 
-This release is primarily a **topology and memory-safety release**.
+---
 
-The important change is a three-level distinction between ways of interpreting
-road linework:
+## Why network centers?
 
-1. **Default — shared-vertex noding.** If two input LineStrings already contain
-   the same source vertex, that vertex is treated as a real junction and both
-   lines are split there. This recovers common OSM-style T- and X-junctions.
-2. **Strict endpoint-only mode.** Use `split_shared_vertices=False` (or
-   `--no-shared-vertex-noding`) only when the source is already segmented at
-   every real junction.
-3. **Explicit planar noding.** Use `node=True` / `--node-crossings` only when
-   every geometric crossing is genuinely connected. This can incorrectly weld
-   a bridge to the road beneath it.
+A coordinate centroid answers a geometric question. It does not necessarily answer an accessibility question.
 
-The default therefore preserves topology already encoded by the data without
-inventing turns at arbitrary map crossings.
+Two locations may be close in straight-line distance but far apart through a road network because of rivers, coastlines, mountains, limited crossings, disconnected streets, or other topological constraints.
 
-Other v0.3.0 changes:
+`netcenter` instead solves location problems using the shortest-path metric \(d_G\) induced by the network.
 
-- genuine shared **interior-interior** junctions are now recovered, not only
-  side-street endpoints touching a through-road;
-- nodes left orphaned after sliver/self-loop filtering are removed before the
-  sparse graph is built;
-- parallel shortest-path blocks stream directly into the final matrix instead
-  of being accumulated and copied with `numpy.vstack`;
-- worker counts and memory controls are validated instead of silently coerced;
-- package version metadata, CLI defaults, documentation, and tests are aligned;
-- one worker remains the conservative default; parallel backends are opt-in.
+### Weighted 1-median
 
-See [`CHANGELOG.md`](CHANGELOG.md) and
-[`docs/REVIEW_NOTES.md`](docs/REVIEW_NOTES.md) for the detailed review.
+For demand locations \(i=1,\dots,k\), non-negative weights \(w_i\), and a candidate location \(x\),
+
+\[
+x^* = \arg\min_x \sum_{i=1}^{k} w_i d_G(x,i).
+\]
+
+This is the **minisum** objective: find the location minimizing aggregate weighted travel distance.
+
+For vertex demand on a network, a median optimum can be chosen at a network vertex. `netcenter` therefore solves this problem over network nodes.
+
+### Vertex 1-center
+
+\[
+x^* = \arg\min_{x\in V} \max_i d_G(x,i).
+\]
+
+This is the **minimax** objective restricted to network vertices. It minimizes the distance to the farthest demand location.
+
+### Absolute 1-center
+
+\[
+x^* = \arg\min_{x\in G} \max_i d_G(x,i).
+\]
+
+Here the candidate location may lie **anywhere on the network**, including in the interior of an edge.
+
+This distinction matters: the true minimax solution need not coincide with a junction.
+
+---
+
+## Literature and algorithmic lineage
+
+`netcenter` implements classical network-location problems rather than proposing a new facility-location algorithm.
+
+The mathematical core follows the literature beginning with:
+
+- **Hakimi, S. L. (1964).** “Optimum Locations of Switching Centers and the Absolute Centers and Medians of a Graph.” *Operations Research*, 12(3), 450–459.  
+  https://doi.org/10.1287/opre.12.3.450
+
+  Hakimi introduced the absolute center and absolute median framework for weighted graphs and established the central distinction used by `netcenter`: median optima may be taken at vertices, while absolute-center optima can lie inside edges.
+
+- **Kariv, O., & Hakimi, S. L. (1979).** “An Algorithmic Approach to Network Location Problems. I: The p-Centers.” *SIAM Journal on Applied Mathematics*, 37(3), 513–538.  
+  https://doi.org/10.1137/0137040
+
+  This is the principal algorithmic reference for the continuous absolute-center problem. `netcenter` uses the classical edgewise distance structure and breakpoint decomposition underlying absolute-center algorithms, while implementing the computation with vectorized prefix/suffix envelope evaluation and additional engineering optimizations.
+
+- **Handler, G. Y., & Mirchandani, P. B. (1979).** *Location on Networks: Theory and Algorithms*. MIT Press.  
+  https://mitpress.mit.edu/9780262080903/location-on-networks/
+
+  A systematic treatment of network median and center problems and the classical edgewise formulation used in the package.
+
+- **Hakimi, S. L. (1965).** “Optimum Distribution of Switching Centers in a Communication Network and Some Related Graph Theoretic Problems.” *Operations Research*, 13(3), 462–475.  
+  https://doi.org/10.1287/opre.13.3.462
+
+  Extends the network-location framework to the \(p\)-median problem. `netcenter` currently solves only \(p=1\).
+
+- **Daskin, M. S. (2013).** *Network and Discrete Location: Models, Algorithms, and Applications*, 2nd ed. Wiley.  
+  https://doi.org/10.1002/9781118537015
+
+  A modern treatment of facility-location models, including the distinction between vertex and absolute center problems.
+
+The implementation should therefore be described as a **computational implementation of classical network-location theory**, with package-specific work concentrated in GIS topology construction, numerical safeguards, vectorization, memory management, pruning, and parallel execution.
+
+See `docs/ALGORITHMS.md` and `docs/TECHNICAL_NOTE.tex` for the detailed derivation and implementation audit.
+
+---
+
+## Installation
+
+### Full GIS installation
+
+```bash
+python -m pip install -e ".[gis]"
+```
+
+### Development installation
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+### Numerical core only
+
+If you already have a sparse graph and do not need GeoPandas/Shapely file I/O:
+
+```bash
+python -m pip install -e .
+```
+
+---
+
+## Quick start
+
+The simplest command is:
+
+```bash
+netcenter roads.gpkg
+```
+
+With explicit demand locations and weights:
+
+```bash
+netcenter roads.gpkg \
+  --layer roads \
+  --demand demand.gpkg \
+  --weight-field weight \
+  --max-snap 1000 \
+  --out centers.gpkg
+```
+
+This computes the weighted 1-median, vertex 1-center, and absolute 1-center.
+
+If no demand layer is supplied, every network node is used as a demand location.
+
+---
+
+## Python API
+
+```python
+from netcenter import build_network, snap_points, solve
+
+net = build_network("roads.gpkg")
+
+# Coordinates must be in net.crs.
+demand_xy = [
+    [305000.0, 1615000.0],
+    [306250.0, 1616200.0],
+]
+
+nodes, snap_distance = snap_points(
+    net,
+    demand_xy,
+    max_dist=1000,
+)
+
+results = solve(
+    net,
+    demand_nodes=nodes,
+    weights=[1200, 800],
+)
+
+print(results["median"])
+print(results["vertex_center"])
+print(results["absolute_center"])
+```
+
+The absolute-center result is either a network node or an edge plus an offset `t` in metres. `solve()` attaches the corresponding map coordinate in `.xy`.
+
+---
+
+## Demand semantics
+
+Demand is represented internally at **network nodes**.
+
+When a GIS demand layer is supplied:
+
+1. empty geometries are removed;
+2. point geometries are used directly;
+3. non-point geometries are converted to representative points;
+4. coordinates are transformed to the network CRS;
+5. each point is snapped to its nearest network node.
+
+This is an explicit modeling choice. Demand is **not** currently placed continuously along edges.
+
+### Repeated demand locations
+
+Several demand observations may snap to the same node.
+
+`netcenter` coalesces them exactly:
+
+- for the median, supplied weights or observation counts are summed;
+- for the center, duplicate copies are irrelevant because repetition does not change a maximum.
+
+This can substantially reduce shortest-path work.
+
+### Snap-distance control
+
+Use:
+
+```bash
+--max-snap 1000
+```
+
+to reject demand points farther than the specified distance from the nearest network node.
+
+If no maximum is supplied, points are still snapped, but large snap distances should be inspected carefully, especially on simplified road networks.
+
+---
+
+## Road-network topology
+
+Correct topology is critical.
+
+A geometric crossing does not necessarily imply a valid turn. A bridge, tunnel, or flyover may cross another road in two dimensions without connecting to it.
+
+`netcenter` therefore distinguishes three topology modes.
+
+### Default: shared-source-vertex noding
+
+```bash
+netcenter roads.gpkg
+```
+
+If two input LineStrings already contain the same source vertex, that location is treated as a genuine junction and participating lines are split there.
+
+This recovers common T- and X-junctions already encoded by the source data without automatically connecting every geometric crossing.
+
+### Strict endpoint-only mode
+
+```bash
+netcenter roads.gpkg --no-shared-vertex-noding
+```
+
+Use this only if the input is already segmented at every true junction.
+
+### Explicit planar noding
+
+```bash
+netcenter roads.gpkg --node-crossings
+```
+
+This treats every geometric crossing as connected.
+
+Use it only for genuinely planar networks. On ordinary road data it can incorrectly connect a bridge to the road beneath it.
+
+---
+
+## Coordinate systems and units
+
+All reported network distances, edge lengths, offsets, and snapping distances are in **metres**.
+
+- projected metre-based input is preserved;
+- geographic input is reprojected to an inferred local UTM CRS unless a target CRS is supplied;
+- projected input using non-metre units is reprojected;
+- an explicit target CRS must be projected and metre-based.
+
+For large or multi-zone study areas, supply a projection appropriate to the full study area rather than relying on an automatically inferred UTM zone.
+
+---
+
+## Shortest-path distance matrix
+
+Let:
+
+- \(k\) = number of unique demand nodes,
+- \(n\) = number of network nodes.
+
+`netcenter` computes
+
+\[
+D_{ij}=d_G(q_i,v_j),
+\]
+
+giving a demand-by-node matrix
+
+\[
+D\in\mathbb{R}^{k\times n}.
+\]
+
+Distances are computed using Dijkstra's shortest-path algorithm through SciPy.
+
+This matrix is then reused by the location solvers.
+
+---
+
+## Weighted 1-median implementation
+
+For each candidate node \(j\),
+
+\[
+M_j=\sum_i w_iD_{ij}.
+\]
+
+The solution is
+
+\[
+j^*=\arg\min_j M_j.
+\]
+
+In the implementation this is a weighted reduction over the shortest-path matrix followed by `argmin`.
+
+When explicit weights are absent, every demand observation has unit weight.
+
+---
+
+## Vertex 1-center implementation
+
+For each candidate node \(j\),
+
+\[
+E_j=\max_iD_{ij}.
+\]
+
+The vertex center is
+
+\[
+j^*=\arg\min_j E_j.
+\]
+
+This is the node-restricted minimax solution.
+
+---
+
+## Exact absolute 1-center
+
+Consider an edge \((u,w)\) of length \(L\), and let \(t\in[0,L]\) denote distance from endpoint \(u\).
+
+For demand node \(v\),
+
+\[
+d(t,v)
+=
+\min\left\{
+d(u,v)+t,\;
+d(w,v)+L-t
+\right\}.
+\]
+
+Each demand therefore contributes a piecewise-linear "tent" function along the edge.
+
+The edge eccentricity is
+
+\[
+E(t)=\max_v d(t,v).
+\]
+
+The route for a demand switches between the two edge endpoints at
+
+\[
+t_v^*
+=
+\frac{d(w,v)-d(u,v)+L}{2}.
+\]
+
+Sorting these breakpoints partitions the edge into intervals in which the upper envelope reduces to
+
+\[
+E(t)=\max\{A+t,\;B+L-t\},
+\]
+
+where \(A\) and \(B\) are fixed on the interval.
+
+The minimum on each interval is therefore analytic. `netcenter` evaluates the necessary prefix/suffix maxima and selects the best candidate.
+
+This is an exact continuous-edge solution for the stored shortest-path metric, modulo floating-point precision and the configured numerical tolerance.
+
+---
+
+## Edge pruning
+
+Sweeping every edge is unnecessary.
+
+The best vertex center first supplies an incumbent radius:
+
+\[
+R_V=\min_j\max_iD_{ij}.
+\]
+
+For edge \((u,w)\), the quantity
+
+\[
+LB_e
+=
+\max_i \min\{D_{iu},D_{iw}\}
+\]
+
+is a lower bound on eccentricity anywhere on that edge.
+
+If this bound cannot improve the incumbent, the edge is discarded before the more expensive breakpoint sweep.
+
+This is an implementation acceleration; it does not change the optimization objective.
+
+---
+
+## Performance and memory
+
+For \(k\) unique demand nodes and \(n\) network nodes, the stored shortest-path matrix requires approximately:
+
+```text
+float64: 8 × k × n bytes
+float32: 4 × k × n bytes
+```
+
+Example:
+
+```text
+2,000 demand nodes × 12,000 network nodes
+```
+
+is approximately:
+
+```text
+float64: 183 MiB
+float32:  92 MiB
+```
+
+Use:
+
+```bash
+netcenter roads.gpkg --float32
+```
+
+to roughly halve matrix storage.
+
+The solver uses a scale-aware numerical margin so float32 rounding cannot incorrectly prune a borderline edge, but the final result remains limited by the precision of the stored matrix.
+
+---
+
+## Parallel execution
+
+The conservative default is one worker:
+
+```bash
+netcenter roads.gpkg
+```
+
+For larger problems:
+
+```bash
+netcenter roads.gpkg --jobs 4 --backend loky
+```
+
+or:
+
+```bash
+netcenter roads.gpkg --jobs 4 --backend threading
+```
+
+`loky` uses processes; `threading` uses shared-memory threads.
+
+Performance depends on graph size, demand count, SciPy build, operating system, memory bandwidth, and available RAM. Benchmark the actual workload rather than assuming that more workers are always faster.
+
+---
+
+## Memory controls
+
+Shortest-path calculations are performed in bounded source blocks.
+
+```bash
+--max-temp-mb
+```
+
+controls the target float64 Dijkstra result size of one block per worker.
+
+The absolute-center sweep is likewise blocked:
+
+```bash
+--max-cells
+```
+
+controls the maximum number of segment-demand cells handled at once.
+
+These settings change memory use, not the mathematical objective.
+
+---
+
+## Output
+
+Console output reports each solved location with:
+
+- objective value;
+- node or edge identifier;
+- edge offset when applicable;
+- map coordinates.
+
+For the median, the CLI also reports the mean weighted network distance.
+
+Spatial output can be written with:
+
+```bash
+netcenter roads.gpkg \
+  --demand demand.gpkg \
+  --out centers.gpkg
+```
+
+The output includes:
+
+- `kind`
+- `objective`
+- `node`
+- `edge`
+- `t_m`
+- geometry
+
+---
+
+## Disconnected networks
+
+All selected demand locations must be reachable through the analyzed network.
+
+If the shortest-path matrix contains infinite distances, `netcenter` fails rather than returning a plausible but mathematically meaningless center.
+
+Depending on the application, repair the topology, restrict the study to a connected component, or solve components separately.
+
+---
+
+## What `netcenter` does not currently implement
+
+The current package is deliberately narrower than the full network-location literature.
+
+Not implemented:
+
+- directed networks;
+- one-way streets;
+- turn restrictions;
+- asymmetric travel costs;
+- time-dependent costs;
+- congestion-dependent travel time;
+- weighted minimax centers;
+- demand located continuously along edges;
+- \(p>1\) center or median problems;
+- automatic inference of bridge/tunnel connectivity from attributes;
+- out-of-core storage for distance matrices too large for RAM.
+
+---
+
+## Network median versus geographic centroid
+
+The weighted network median is **not** an arithmetic centroid.
+
+A weighted Euclidean centroid minimizes squared Euclidean distance and can be written
+
+\[
+\bar{x}
+=
+\frac{\sum_i w_ix_i}{\sum_iw_i}.
+\]
+
+The network median instead minimizes
+
+\[
+\sum_i w_id_G(x,i).
+\]
+
+It is therefore better interpreted as a **network-accessibility center under a minisum objective** than as a literal coordinate centroid.
+
+A closer network analogue to a Euclidean centroid would be a network Fréchet mean or barycenter,
+
+\[
+x^*
+=
+\arg\min_{x\in G}
+\sum_iw_i d_G(x,i)^2,
+\]
+
+which is **not currently implemented**.
+
+---
+
+## Choosing an objective
+
+Use the **weighted 1-median** when the goal is to minimize aggregate weighted network distance.
+
+Use the **vertex 1-center** when the worst-served demand matters and the facility must coincide with an existing network node.
+
+Use the **absolute 1-center** when the worst-served demand matters and the facility may be located anywhere along the network.
+
+There is no universal definition of "the center" of a network. The appropriate objective depends on the application.
 
 ---
 
@@ -89,263 +629,42 @@ netcenter/
 └─ pyproject.toml
 ```
 
-If you want to understand the code rather than merely run it, read in this
-order:
+For understanding the implementation, read approximately in this order:
 
 ```text
-solve.py -> center.py -> distances.py -> graph.py -> topology.py
+solve.py
+  ↓
+center.py
+  ↓
+distances.py
+  ↓
+graph.py
+  ↓
+topology.py
 ```
-
----
-
-## Installation
-
-### Full GIS installation
-
-```bash
-python -m pip install -e ".[gis]"
-```
-
-### Development installation
-
-```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q
-```
-
-### Numerical core only
-
-If you already have a sparse graph and do not need GeoPandas/Shapely file I/O:
-
-```bash
-python -m pip install -e .
-```
-
----
-
-## Command-line use
-
-Minimal:
-
-```bash
-netcenter roads.gpkg
-```
-
-With demand points and weights:
-
-```bash
-netcenter roads.gpkg \
-  --layer roads \
-  --demand barangays.gpkg \
-  --weight-field population \
-  --max-snap 1000 \
-  --float32 \
-  --out centers.gpkg
-```
-
-### Topology options
-
-Default, recommended for OSM-shaped/routing-quality linework:
-
-```bash
-netcenter roads.gpkg
-```
-
-Disable shared-vertex splitting only if the source is already segmented at all
-true junctions:
-
-```bash
-netcenter roads.gpkg --no-shared-vertex-noding
-```
-
-Treat every drawn crossing as connected only for genuinely planar data:
-
-```bash
-netcenter roads.gpkg --node-crossings
-```
-
-### Parallel execution
-
-The safe default is one worker:
-
-```bash
-netcenter roads.gpkg
-```
-
-For a large problem, try more workers deliberately:
-
-```bash
-netcenter roads.gpkg --jobs 4 --backend loky
-```
-
-Or, on a memory-constrained system, compare the shared-memory backend:
-
-```bash
-netcenter roads.gpkg --jobs 4 --backend threading
-```
-
-Parallel speedups vary by graph size, number of demand nodes, SciPy build,
-operating system, and available RAM. Benchmark the actual workload rather than
-assuming a backend is universally faster.
-
----
-
-## Python use
-
-```python
-from netcenter import build_network, snap_points, solve
-
-net = build_network("roads.gpkg")
-
-# Coordinates must be in net.crs.
-demand_xy = [
-    [305000.0, 1615000.0],
-    [306250.0, 1616200.0],
-]
-
-nodes, snap_distance = snap_points(net, demand_xy, max_dist=1000)
-
-results = solve(
-    net,
-    demand_nodes=nodes,
-    weights=[1200, 800],
-    dtype="float32",
-)
-
-print(results["median"])
-print(results["vertex_center"])
-print(results["absolute_center"])
-```
-
-The absolute-centre result is either a node or an edge plus an offset `t` in
-metres. `solve()` attaches the corresponding map coordinate in `.xy`.
-
----
-
-## Demand semantics
-
-Demand is represented at **network nodes**.
-
-`snap_points()` finds the nearest node, not the nearest arbitrary point along an
-edge. This makes the mathematical problem explicit and allows repeated demand
-locations to be consolidated exactly, but it also means a simplified road
-network can move a demand point farther than expected.
-
-Inspect the reported snap distances and use `--max-snap` in production work.
-
-Repeated demand observations are handled exactly:
-
-- multiplicity does not affect a maximum, so the centre uses each unique demand
-  node once;
-- multiplicity does affect the median, so counts or supplied weights are summed
-  at each unique snapped node.
-
-`weights` affect the **median only**. The centre objective is currently
-unweighted over the chosen demand locations.
-
----
-
-## CRS and distance units
-
-All reported network distances, edge lengths, snap grid spacing, and offsets are
-in **metres**.
-
-- projected metre-based input is preserved;
-- geographic input is moved to an inferred local UTM CRS unless you supply a
-  target CRS;
-- projected input using feet or another unit is also reprojected;
-- an explicit `target_crs` must be projected and metre-based.
-
-For a large multi-zone study area, supply a projection appropriate to the full
-extent instead of relying on one inferred UTM zone.
-
----
-
-## Memory model
-
-For `k` unique demand nodes and `n` network nodes, the stored shortest-path
-matrix is approximately:
-
-```text
-float64: 8 x k x n bytes
-float32: 4 x k x n bytes
-```
-
-Example: 2,000 demand nodes by 12,000 network nodes is about 183 MiB in float64
-or 92 MiB in float32.
-
-`distance_matrix()` computes SciPy Dijkstra output in bounded row chunks. The
-`max_temp_mb` / `--max-temp-mb` setting controls the target float64 result size
-of **one chunk per worker**. With several workers, several chunks can exist at
-once, so reduce the budget when RAM is the bottleneck.
-
-Parallel results are streamed into a preallocated final matrix. The previous
-implementation retained all returned blocks and then used `numpy.vstack`, which
-could transiently duplicate most of the distance matrix.
-
-`float32` is a memory/precision trade-off. The centre solver widens its pruning
-margin according to the stored dtype so rounding cannot incorrectly eliminate a
-borderline candidate edge, but the final objective is still limited by the
-precision of the stored matrix.
-
----
-
-## Absolute 1-centre in one paragraph
-
-For a point `t` metres along edge `(u, w)` of length `L`, distance to demand
-node `v` is
-
-```text
-d(t, v) = min(d(u, v) + t, d(w, v) + L - t).
-```
-
-Each demand therefore contributes a tent-shaped function along the edge. The
-worst-demand distance is the upper envelope of those functions. Once the switch
-points are sorted, every interval reduces to the maximum of one rising and one
-falling line, whose minimum is analytic. A lower bound first eliminates edges
-that cannot improve the best vertex centre, so only surviving edges need the
-exact sweep.
-
-See [`docs/ALGORITHMS.md`](docs/ALGORITHMS.md) for the compact derivation and references, or [`docs/TECHNICAL_NOTE.tex`](docs/TECHNICAL_NOTE.tex) for the full LaTeX discussion and explicit audit of how v0.3.0 differs from the initial prototype.
-
----
-
-## Scope and non-goals
-
-Implemented:
-
-- undirected non-negative road costs;
-- vertex demand;
-- weighted 1-median;
-- unweighted vertex centre;
-- exact unweighted absolute 1-centre;
-- GIS linework -> sparse network conversion;
-- shared-source-vertex topology recovery;
-- optional explicit planar noding.
-
-Not implemented:
-
-- one-way streets or directed graphs;
-- turn restrictions;
-- time-dependent or asymmetric travel costs;
-- weighted minimax centre;
-- demand placed continuously along edges;
-- automatic inference of bridge/tunnel semantics from attributes;
-- out-of-core storage for a distance matrix too large for RAM.
 
 ---
 
 ## Validation
 
-The development suite contains **69 tests** in this release. It includes:
+The test suite includes:
 
-- hand-computable centre/median cases;
+- analytically checkable median and center cases;
+- continuous edge-interior center cases;
 - random-network comparison with independent brute-force edge sampling;
-- serial/parallel and block-size invariance checks;
+- serial/parallel invariance;
+- block-size invariance;
+- float32 behavior;
+- T-junction recovery;
+- interior-interior shared-vertex recovery;
 - bridge versus true-junction topology regressions;
-- T-junction and interior-interior shared-vertex regressions;
-- CRS/unit, closed-ring, empty-geometry, sliver, and component regressions;
-- distance chunking, float32, worker validation, and package-metadata checks.
+- parallel-edge handling;
+- closed rings;
+- disconnected networks;
+- CRS and unit handling;
+- sliver and self-loop filtering;
+- worker and memory-control validation;
+- package metadata checks.
 
 Run:
 
@@ -353,10 +672,28 @@ Run:
 python -m pytest -q
 ```
 
-For the validation philosophy, see [`docs/VALIDATION.md`](docs/VALIDATION.md).
+See `docs/VALIDATION.md` for the validation philosophy and `docs/ALGORITHMS.md` for the full mathematical and bibliographic discussion.
+
+---
+
+## References
+
+Daskin, M. S. (2013). *Network and Discrete Location: Models, Algorithms, and Applications* (2nd ed.). Wiley. https://doi.org/10.1002/9781118537015
+
+Dijkstra, E. W. (1959). A note on two problems in connexion with graphs. *Numerische Mathematik*, 1, 269–271.
+
+Hakimi, S. L. (1964). Optimum locations of switching centers and the absolute centers and medians of a graph. *Operations Research*, 12(3), 450–459. https://doi.org/10.1287/opre.12.3.450
+
+Hakimi, S. L. (1965). Optimum distribution of switching centers in a communication network and some related graph theoretic problems. *Operations Research*, 13(3), 462–475. https://doi.org/10.1287/opre.13.3.462
+
+Handler, G. Y., & Mirchandani, P. B. (1979). *Location on Networks: Theory and Algorithms*. MIT Press.
+
+Kariv, O., & Hakimi, S. L. (1979). An algorithmic approach to network location problems. I: The p-centers. *SIAM Journal on Applied Mathematics*, 37(3), 513–538. https://doi.org/10.1137/0137040
+
+Kariv, O., & Hakimi, S. L. (1979). An algorithmic approach to network location problems. II: The p-medians. *SIAM Journal on Applied Mathematics*, 37(3), 539–560. https://doi.org/10.1137/0137041
 
 ---
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See `LICENSE`.
